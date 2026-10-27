@@ -1,0 +1,114 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "127.0.0.1:4000:4000"
+    environment:
+      DATABASE_HOST: db
+    # Docker Desktop provides this already; the mapping makes Linux hosts reach bin/claude_bridge too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/app
+      # Linux build artifacts stay in the container, never mixed with host builds.
+      - deps:/app/deps
+      - build:/app/_build
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:4000/"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      # deps.get, ash.setup and the first compile run before the endpoint listens.
+      start_period: 300s
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # Stands in for bin/claude_bridge in e2e runs: canned agent results, no claude.
+  fake-bridge:
+    image: python:3.13-slim
+    profiles: ["e2e"]
+    working_dir: /app
+    command: python3 -u bin/fake_claude_bridge
+    volumes:
+      # Reads (or creates) the same .claude-bridge-token the app reads.
+      - .:/app
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('localhost', 4141))"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # A second app instance for e2e: its own database and build, talking to fake-bridge.
+  web-e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    profiles: ["e2e"]
+    environment:
+      DATABASE_HOST: db
+      DATABASE_NAME: weworkai_e2e
+      CLAUDE_BRIDGE_URL: http://fake-bridge:4141
+      LOG_LEVEL: info
+    volumes:
+      - .:/app
+      - deps:/app/deps
+      # Its own _build: two dev servers compiling into one would clash.
+      - build_e2e:/app/_build
+    healthcheck:
+      # The tailwind and esbuild watchers finish after the endpoint listens: wait for the
+      # bundles too, or the first screenshots of a fresh checkout have no styles.
+      test:
+        - "CMD-SHELL"
+        - >-
+          curl -fsS -o /dev/null http://localhost:4000/
+          && curl -fsS http://localhost:4000/assets/css/app.css | grep -q orpheus
+          && curl -fsS http://localhost:4000/assets/js/app.js | grep -q LiveSocket
+      interval: 3s
+      timeout: 5s
+      retries: 10
+      start_period: 300s
+    depends_on:
+      db:
+        condition: service_healthy
+      fake-bridge:
+        condition: service_healthy
+
+  e2e:
+    image: mcr.microsoft.com/playwright:v1.64.1-noble
+    profiles: ["e2e"]
+    working_dir: /e2e
+    # Docker's default 64 MB /dev/shm is too small for Chromium, whose tabs then crash ("Page crashed").
+    shm_size: "2gb"
+    environment:
+      BASE_URL: http://web-e2e:4000
+    volumes:
+      - ./e2e:/e2e
+      # Linux node_modules stay in the container, never mixed with a host install.
+      - e2e_node_modules:/e2e/node_modules
+    command: sh -c "npm ci && npx playwright test"
+    depends_on:
+      web-e2e:
+        condition: service_healthy
+
+volumes:
+  e2e_node_modules:
+  deps:
+  build:
+  build_e2e:
+  postgres:

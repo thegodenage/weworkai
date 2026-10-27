@@ -1,0 +1,1285 @@
+#!/usr/bin/env python3
+"""Lets the Dockerized app run Claude Code agents on this computer, each in a throwaway container.
+
+Run it on the host (not in Docker): `bin/claude_bridge`. It listens on 127.0.0.1 only;
+Docker Desktop forwards the container's host.docker.internal here.
+
+Only fixed `claude`, `git` and `docker` argvs run (no shell), every input is checked
+against an allowlist, and only non-secret fields are returned.
+
+Agents run headless (`claude -p --output-format stream-json`) with every permission
+granted, inside `docker run --rm` containers of the image in docker/agent (built and
+tagged by its content at startup, or with `--build-image`). Only the run's folder (under
+CLAUDE_BRIDGE_ROOTS, colon-separated, default ~/Projects) and its git directory are
+mounted, read-only unless the profile writes (see PROFILES). Agents log in with the token
+from `claude setup-token` saved in CLAUDE_BRIDGE_STATE/oauth-token; it reaches only the
+agent containers' environment, never argv, a log or an HTTP reply. CLAUDE_AGENT_MEMORY
+(default 4g) and CLAUDE_AGENT_CPUS (default 2) limit every container.
+
+Each run's stream lands in CLAUDE_BRIDGE_STATE (default ~/.weworkai-bridge)/runs/<id>.jsonl
+next to <id>.json (metadata), so runs outlive a bridge restart. Finished runs are deleted
+after CLAUDE_BRIDGE_KEEP_DAYS (default 7).
+
+`bin/claude_bridge --self-test` checks argument building, validation and log rendering
+without starting claude or docker.
+"""
+
+import base64
+import dataclasses
+import hashlib
+import hmac
+import json
+import os
+import pathlib
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+PORT = int(os.environ.get("CLAUDE_BRIDGE_PORT", "4141"))
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# Lives in the repo root, which Docker mounts at /app, so the app reads the same token.
+TOKEN_FILE = REPO_ROOT / ".claude-bridge-token"
+ROOTS = [
+    pathlib.Path(root).expanduser().resolve()
+    for root in os.environ.get("CLAUDE_BRIDGE_ROOTS", "~/Projects").split(":")
+]
+STATE_DIR = pathlib.Path(os.environ.get("CLAUDE_BRIDGE_STATE", "~/.weworkai-bridge")).expanduser()
+RUNS_DIR = STATE_DIR / "runs"
+AGENT_TOKEN_FILE = STATE_DIR / "oauth-token"
+IMAGE_DIR = REPO_ROOT / "docker" / "agent"
+IMAGE_NAME = "weworkai-agent"
+DIND_IMAGE = "docker:27.5.1-dind"
+# Conversations live here across runs; claude keys them by cwd, which is the host path.
+CONVERSATIONS_VOLUME = "weworkai-agent-claude"
+CONVERSATIONS_DIR = "/home/agent/.claude"
+# Loopback of the network namespace the qa agent shares with its sidecar, so no other
+# container reaches that privileged daemon.
+SIDECAR_DOCKER_HOST = "tcp://127.0.0.1:2375"
+MEMORY = os.environ.get("CLAUDE_AGENT_MEMORY", "4g")
+CPUS = os.environ.get("CLAUDE_AGENT_CPUS", "2")
+KEEP_SECONDS = float(os.environ.get("CLAUDE_BRIDGE_KEEP_DAYS", "7")) * 86_400
+PRUNE_EVERY_SECONDS = 3_600
+STATUS_FIELDS = {"loggedIn", "email", "orgName", "subscriptionType", "authMethod"}
+
+# The CLI has no command that lists models, so the list lives here, next to the CLI it
+# describes. Aliases always resolve to the latest model of that family.
+MODELS = [
+    {"id": "fable", "label": "Fable (latest)"},
+    {"id": "opus", "label": "Opus (latest)"},
+    {"id": "sonnet", "label": "Sonnet (latest)"},
+    {"id": "haiku", "label": "Haiku (latest)"},
+    {"id": "claude-fable-5-1", "label": "Fable 5.1"},
+    {"id": "claude-opus-5-5", "label": "Opus 5.5"},
+    {"id": "claude-sonnet-5-5", "label": "Sonnet 5.5"},
+    {"id": "claude-haiku-5-5", "label": "Haiku 5.5"},
+]
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+
+@dataclasses.dataclass(frozen=True)
+class Profile:
+    folder_writable: bool
+    git_writable: bool
+    # A per-run docker:dind sidecar, never the host's Docker.
+    docker: bool
+
+
+# Agents may do anything inside their container; a profile only decides what it can reach.
+# git_writable lets a coder commit onto its worktree branch; it implies folder_writable.
+PROFILES = {
+    "planner": Profile(folder_writable=False, git_writable=False, docker=False),
+    "reviewer": Profile(folder_writable=False, git_writable=False, docker=False),
+    "coder": Profile(folder_writable=True, git_writable=True, docker=False),
+    "custom": Profile(folder_writable=True, git_writable=True, docker=False),
+    "qa": Profile(folder_writable=True, git_writable=False, docker=True),
+}
+
+# Runs the app starts are named cph-<8 chars>.
+SESSION_NAME = re.compile(r"^cph-[0-9a-z]{8}$")
+RUN_ID = re.compile(r"^[0-9a-f]{8}$")
+CONVERSATION_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+WORKTREE_NAME = re.compile(r"^[0-9a-z-]{1,40}$")
+# A file name with no folder part, as the app stores it (Weworkai.Board.TaskAttachment).
+ATTACHMENT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_ .()-]{0,199}")
+# The app's limit on a task's files, which every run on the task carries.
+MAX_ATTACHMENT_BYTES = 100_000_000
+# A prompt goes to claude on stdin, so it is not bound by ARG_MAX (~1 MB on macOS); the
+# system prompt still goes in argv. The body fits both even when every character is escaped.
+MAX_PROMPT = 400_000
+MAX_SYSTEM_PROMPT = 20_000
+# Attachments arrive base64 encoded, a third larger than the files.
+MAX_BODY = 3_000_000 + MAX_ATTACHMENT_BYTES * 4 // 3 + 1_000_000
+MAX_SCHEMA = 20_000
+MAX_OUTPUT = 60_000
+MAX_DIFF = 300_000
+MAX_FOLDERS = 500
+MAX_TOOL_SUMMARY = 160
+
+meta_lock = threading.Lock()
+# Runs this bridge process started and has not reaped yet; any other run is checked by its container.
+children = {}
+image_lock = threading.Lock()
+image_builder = None
+# Held from the "still running" check until the new run's metadata exists, so two starts
+# resuming one conversation can't both pass the check.
+start_lock = threading.Lock()
+# Finished runs never change again, so the 2s session listing reads each one's file once.
+finished_runs = {}
+last_prune = 0.0
+
+
+class Rejected(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def text_field(body, key, limit):
+    value = body.get(key)
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise Rejected(422, f"invalid {key}")
+    return value
+
+
+def allowed_folder(raw):
+    folder = pathlib.Path(raw).expanduser().resolve()
+    if not folder.is_dir():
+        raise Rejected(422, f"{raw} is not a folder on this computer")
+    if not any(folder == root or root in folder.parents for root in ROOTS):
+        allowed = ", ".join(str(root) for root in ROOTS)
+        raise Rejected(422, f"{raw} is outside the allowed folders ({allowed})")
+    return folder
+
+
+def parse_attachments(raw):
+    """(folder name, {file name: bytes}) from the app's `attachments`, or None for a run without."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("files"), list):
+        raise Rejected(422, "invalid attachments")
+    folder = raw.get("folder")
+    if not (isinstance(folder, str) and WORKTREE_NAME.fullmatch(folder)):
+        raise Rejected(422, "invalid attachments folder")
+    files = {}
+    for entry in raw["files"]:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if not (isinstance(name, str) and ATTACHMENT_NAME.fullmatch(name)):
+            raise Rejected(422, "invalid attachment name")
+        try:
+            files[name] = base64.b64decode(entry.get("content"), validate=True)
+        except (TypeError, ValueError):
+            raise Rejected(422, f"attachment {name} is not base64")
+    if sum(map(len, files.values())) > MAX_ATTACHMENT_BYTES:
+        raise Rejected(422, f"attachments exceed {MAX_ATTACHMENT_BYTES // 1_000_000} MB")
+    return folder, files
+
+
+@dataclasses.dataclass(frozen=True)
+class RunRequest:
+    name: str
+    cwd: pathlib.Path
+    model: str
+    effort: str | None
+    system_prompt: str | None
+    prompt: str
+    profile: str
+    json_schema: dict | None
+    resume: str | None
+    # Continues a copy of `resume` under a new conversation id, so the original is left as it was.
+    fork: bool
+    attachments: tuple[str, dict[str, bytes]] | None
+
+    @classmethod
+    def parse(cls, body):
+        name = text_field(body, "name", 20)
+        model = text_field(body, "model", 100)
+        profile = text_field(body, "profile", 20)
+        prompt = text_field(body, "prompt", MAX_PROMPT)
+        effort = body.get("effort")
+        system_prompt = body.get("systemPrompt")
+        json_schema = body.get("jsonSchema")
+        resume = body.get("resume")
+        fork = body.get("fork", False)
+
+        if not SESSION_NAME.match(name):
+            raise Rejected(422, "invalid session name")
+        if model not in {entry["id"] for entry in MODELS}:
+            raise Rejected(422, f"model {model} is not offered")
+        if effort is not None and effort not in EFFORTS:
+            raise Rejected(422, f"effort {effort} is not offered")
+        if profile not in PROFILES:
+            raise Rejected(422, f"profile {profile} is not allowed")
+        if system_prompt is not None and (not isinstance(system_prompt, str) or len(system_prompt) > MAX_SYSTEM_PROMPT):
+            raise Rejected(422, "invalid system prompt")
+        if json_schema is not None and (not isinstance(json_schema, dict) or len(json.dumps(json_schema)) > MAX_SCHEMA):
+            raise Rejected(422, "invalid jsonSchema")
+        if resume is not None and not (isinstance(resume, str) and CONVERSATION_ID.match(resume)):
+            raise Rejected(422, "invalid resume")
+        if not isinstance(fork, bool) or (fork and resume is None):
+            raise Rejected(422, "invalid fork: it needs a resume")
+
+        return cls(name, allowed_folder(text_field(body, "cwd", 1000)), model, effort,
+                   system_prompt or None, prompt, profile, json_schema, resume, fork,
+                   parse_attachments(body.get("attachments")))
+
+    def conversation_id(self):
+        """The conversation this run writes: the resumed one, or a new one (a fork is new too)."""
+        return self.resume if self.resume and not self.fork else str(uuid.uuid4())
+
+
+def claude_argv(request, conversation_id):
+    argv = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+            "-n", request.name, "--model", request.model]
+    if request.resume:
+        argv += ["--resume", request.resume]
+    if request.fork:
+        # claude accepts --session-id beside --resume only for a fork.
+        argv += ["--fork-session"]
+    if request.resume is None or request.fork:
+        argv += ["--session-id", conversation_id]
+    if request.effort:
+        argv += ["--effort", request.effort]
+    if request.system_prompt:
+        argv += ["--append-system-prompt", request.system_prompt]
+    if request.json_schema is not None:
+        argv += ["--json-schema", json.dumps(request.json_schema)]
+    return argv
+
+
+@dataclasses.dataclass(frozen=True)
+class Mount:
+    path: pathlib.Path
+    read_only: bool
+
+    def flags(self):
+        # Same path inside as on the host: a worktree's .git file and claude's per-cwd
+        # conversations both name host paths.
+        return ["--mount", f"type=bind,source={self.path},target={self.path}" + (",readonly" if self.read_only else "")]
+
+
+def git_directory(folder):
+    """The repository's shared git directory (a worktree's lives in the main repo), or None."""
+    completed = git(folder, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return pathlib.Path(completed.stdout.strip()).resolve() if completed.returncode == 0 else None
+
+
+def mounts(folder, profile, git_dir):
+    result = [Mount(folder, read_only=not profile.folder_writable)]
+    if git_dir is None:
+        return result
+    inside = folder in git_dir.parents
+    if not inside or (profile.folder_writable and not profile.git_writable):
+        result.append(Mount(git_dir, read_only=not profile.git_writable))
+    if profile.git_writable:
+        # git runs hooks and config-named commands (core.fsmonitor, filters) on the host
+        # too, so an agent that could rewrite these would run code outside its container.
+        result += [Mount(git_dir / "config", read_only=True), Mount(git_dir / "hooks", read_only=True)]
+    return result
+
+
+def container_name(run_id):
+    return f"cph-{run_id}"
+
+
+def sidecar_name(run_id):
+    return f"cph-{run_id}-dind"
+
+
+def limits(run_id):
+    return ["--label", f"weworkai.run={run_id}", "--memory", MEMORY, "--cpus", CPUS]
+
+
+def sidecar_argv(run_id):
+    return ["docker", "run", "--detach", "--rm", "--privileged", "--name", sidecar_name(run_id), *limits(run_id),
+            DIND_IMAGE, "dockerd", f"--host={SIDECAR_DOCKER_HOST}", "--tls=false"]
+
+
+def docker_argv(run_id, request, conversation_id, image, run_mounts, sidecar, environment_names):
+    """`environment_names` are passed by name only, so their values (the token) never sit in argv."""
+    network = ["--network", f"container:{sidecar}", "--env", f"DOCKER_HOST={SIDECAR_DOCKER_HOST}"] if sidecar \
+        else ["--network", "bridge"]
+    return ["docker", "run", "--rm", "--interactive", "--init", "--name", container_name(run_id), *limits(run_id),
+            "--security-opt", "no-new-privileges", *network,
+            "--mount", f"type=volume,source={CONVERSATIONS_VOLUME},target={CONVERSATIONS_DIR}",
+            *(flag for mount in run_mounts for flag in mount.flags()),
+            *(flag for name in environment_names for flag in ("--env", name)),
+            "--workdir", str(request.cwd), image, *claude_argv(request, conversation_id)]
+
+
+def git_identity(folder):
+    """The host's git identity for that repo, so the agent's commits are the user's."""
+    values = {field: git(folder, "config", f"user.{field.lower()}").stdout.strip() for field in ("NAME", "EMAIL")}
+    return {f"GIT_{role}_{field}": value for role in ("AUTHOR", "COMMITTER")
+            for field, value in values.items() if value}
+
+
+def short_path(path):
+    home = pathlib.Path.home()
+    return f"~/{path.relative_to(home)}" if home in path.parents else str(path)
+
+
+# Only a subscription token (`claude setup-token`) is accepted, never an API key, so agents
+# always bill to the Claude plan. Pasting the command's whole output works too.
+SUBSCRIPTION_TOKEN = re.compile(r"sk-ant-oat01-[A-Za-z0-9_-]+")
+
+
+def agent_token():
+    content = AGENT_TOKEN_FILE.read_text() if AGENT_TOKEN_FILE.exists() else ""
+    token = SUBSCRIPTION_TOKEN.search(content)
+    if token is None:
+        raise Rejected(422, f"Agents have no Claude subscription login: run `claude setup-token` and save "
+                            f"the sk-ant-oat01-… token it prints to {short_path(AGENT_TOKEN_FILE)}"
+                            + (" (an API key is not accepted)" if "sk-ant-api" in content else ""))
+    return token.group(0)
+
+
+def docker(*args, timeout=60):
+    return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def require_docker():
+    if docker("info", "--format", "{{.ServerVersion}}", timeout=20).returncode != 0:
+        raise Rejected(503, "Docker is not running. Start Docker Desktop: agents run in containers")
+
+
+def build_args():
+    # Docker Desktop maps file ownership itself; on Linux the agent must be the host user.
+    if sys.platform != "linux":
+        return []
+    return ["--build-arg", f"AGENT_UID={os.getuid()}", "--build-arg", f"AGENT_GID={os.getgid()}"]
+
+
+def image_tag():
+    digest = hashlib.sha256(" ".join(build_args()).encode())
+    for path in sorted(IMAGE_DIR.iterdir()):
+        digest.update(path.name.encode() + b"\0" + path.read_bytes())
+    return f"{IMAGE_NAME}:{digest.hexdigest()[:12]}"
+
+
+def agent_version():
+    match = re.search(r"^ARG CLAUDE_CODE_VERSION=(\S+)$", (IMAGE_DIR / "Dockerfile").read_text(), re.MULTILINE)
+    return f"{match.group(1)} (Claude Code)"
+
+
+def build_image(tag):
+    print(f"claude_bridge: building the agent image {tag}", flush=True)
+    built = subprocess.run(["docker", "build", "--tag", tag, "--tag", f"{IMAGE_NAME}:latest", *build_args(),
+                            str(IMAGE_DIR)])
+    pulled = subprocess.run(["docker", "pull", "--quiet", DIND_IMAGE], stdout=subprocess.DEVNULL)
+    print(f"claude_bridge: agent image {'ready' if built.returncode == pulled.returncode == 0 else 'build failed'}",
+          flush=True)
+    return built.returncode == 0
+
+
+def require_image():
+    """The current agent image's tag; a missing image is built in the background meanwhile."""
+    global image_builder
+    tag = image_tag()
+    if docker("image", "inspect", tag).returncode == 0:
+        return tag
+    with image_lock:
+        if image_builder is None or not image_builder.is_alive():
+            image_builder = threading.Thread(target=build_image, args=(tag,), daemon=True)
+            image_builder.start()
+    raise Rejected(503, "The agent image is being built (the first build takes a few minutes); try again then")
+
+
+def tool_summary(name, tool_input):
+    key = {"Bash": "command", "Read": "file_path", "Write": "file_path", "Edit": "file_path",
+           "Grep": "pattern", "Glob": "pattern", "Task": "description"}.get(name)
+    detail = tool_input.get(key) if key else json.dumps(tool_input)
+    return f"→ {name}: {str(detail).splitlines()[0] if detail else ''}"[:MAX_TOOL_SUMMARY]
+
+
+def render(events):
+    lines = []
+    for event in events:
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+        if event.get("subtype") == "permission_denied":
+            lines.append(f"  ✗ {event.get('tool_name')} denied: not allowed for this agent")
+        elif event.get("type") == "assistant":
+            for block in blocks:
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    lines.append(block["text"].strip())
+                elif block.get("type") == "tool_use" and block.get("name") != "StructuredOutput":
+                    lines.append(tool_summary(block.get("name"), block.get("input") or {}))
+        elif event.get("type") == "user":
+            for block in blocks:
+                if block.get("type") == "tool_result" and block.get("is_error"):
+                    text = block.get("content") if isinstance(block.get("content"), str) else "tool failed"
+                    lines.append(f"  ✗ {text.strip()[:MAX_TOOL_SUMMARY]}")
+        elif event.get("type") == "result":
+            outcome = "failed" if event.get("is_error") else "finished"
+            cost = event.get("total_cost_usd") or 0
+            lines.append(f"── {outcome} · {event.get('num_turns', 0)} turns · ${cost:.4f}")
+            if event.get("result"):
+                lines.append(str(event["result"]))
+    text = "\n".join(lines)
+    return text[-MAX_OUTPUT:]
+
+
+def read_events(path):
+    events = []
+    if not path.exists():
+        return events
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                # The last line may still be half written.
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def result_event(events):
+    return next((event for event in reversed(events) if event.get("type") == "result"), None)
+
+
+def final_status(meta, result):
+    if meta.get("stopped"):
+        return "stopped"
+    if result is None or result.get("is_error") or meta.get("exitCode") not in (None, 0):
+        return "failed"
+    return "done"
+
+
+def run_paths(run_id):
+    return RUNS_DIR / f"{run_id}.json", RUNS_DIR / f"{run_id}.jsonl"
+
+
+def read_meta(run_id):
+    meta_path, _ = run_paths(run_id)
+    if not meta_path.exists():
+        raise Rejected(404, "session not found")
+    return json.loads(meta_path.read_text())
+
+
+def update_meta(run_id, **changes):
+    with meta_lock:
+        meta = {**read_meta(run_id), **changes}
+        meta_path, _ = run_paths(run_id)
+        temporary = meta_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(meta))
+        temporary.replace(meta_path)
+        return meta
+
+
+def process_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        # PermissionError: the pid was reused by another user's process, so the run's ended.
+        return False
+    return True
+
+
+def container_running(name):
+    return docker("inspect", "--format", "{{.State.Running}}", name, timeout=20).stdout.strip() == "true"
+
+
+def run_alive(run_id, meta):
+    if run_id in children:
+        return True
+    # Runs from before agents moved into containers ran on the host.
+    if meta.get("container") is None:
+        return process_alive(meta["pid"])
+    # Started by an earlier bridge process: its `docker run` is no child of ours.
+    return container_running(meta["container"])
+
+
+def remove_containers(*names):
+    present = [name for name in names if name]
+    if present:
+        docker("rm", "--force", "--volumes", *present)
+
+
+def settle(run_id, meta):
+    """Status of a run; once it has finished the status is stored, so later reads skip the log."""
+    if meta.get("status") in ("done", "failed", "stopped"):
+        return meta
+    if not meta.get("stopped") and run_alive(run_id, meta):
+        return {**meta, "status": "running"}
+    remove_containers(meta.get("sidecar"))
+    result = result_event(read_events(run_paths(run_id)[1]))
+    return update_meta(run_id, status=final_status(meta, result),
+                       costUsd=(result or {}).get("total_cost_usd"))
+
+
+def summary(meta):
+    return {**{key: meta.get(key) for key in ("id", "name", "status", "cwd", "startedAt")},
+            "lastEventAt": last_event_at(meta)}
+
+
+def last_event_at(meta):
+    """When the run's stream last grew: the app stops a running agent that stays silent too long."""
+    log = run_paths(meta["id"])[1]
+    if not log.exists():
+        return meta.get("startedAt")
+    return datetime.fromtimestamp(log.stat().st_mtime, timezone.utc).isoformat()
+
+
+def finished(meta):
+    return meta.get("status") in ("done", "failed", "stopped")
+
+
+def current_meta(run_id):
+    if run_id in finished_runs:
+        return finished_runs[run_id]
+    meta = settle(run_id, read_meta(run_id))
+    if finished(meta):
+        finished_runs[run_id] = meta
+    return meta
+
+
+def all_runs():
+    if not RUNS_DIR.exists():
+        return []
+    run_ids = [path.stem for path in RUNS_DIR.glob("*.json") if RUN_ID.match(path.stem)]
+    return [current_meta(run_id) for run_id in run_ids]
+
+
+def prune_runs(now):
+    """Deletes every file of runs that finished more than KEEP_SECONDS ago."""
+    global last_prune
+    last_prune = now
+    for meta in all_runs():
+        meta_path, _ = run_paths(meta["id"])
+        # A finished run's metadata is last written when it settles.
+        if finished(meta) and now - meta_path.stat().st_mtime > KEEP_SECONDS:
+            for path in RUNS_DIR.glob(f"{meta['id']}.*"):
+                path.unlink(missing_ok=True)
+            finished_runs.pop(meta["id"], None)
+
+
+def list_sessions(_body):
+    now = time.time()
+    if now - last_prune > PRUNE_EVERY_SECONDS:
+        prune_runs(now)
+    return {"sessions": [summary(meta) for meta in all_runs()]}
+
+
+def usage(result):
+    """What the run used, from its final `result` event: this process's turns only, so a resumed
+    conversation's earlier runs are not counted again. None until the run has a result."""
+    if result is None:
+        return None
+    tokens = result.get("usage") or {}
+    return {
+        "inputTokens": tokens.get("input_tokens") or 0,
+        "outputTokens": tokens.get("output_tokens") or 0,
+        "cacheReadTokens": tokens.get("cache_read_input_tokens") or 0,
+        "cacheCreationTokens": tokens.get("cache_creation_input_tokens") or 0,
+        "costUsd": result.get("total_cost_usd") or 0,
+        "durationMs": result.get("duration_ms") or 0,
+        "turns": result.get("num_turns") or 0,
+    }
+
+
+def show_session(_body, run_id):
+    meta = settle(run_id, read_meta(run_id))
+    events = read_events(run_paths(run_id)[1])
+    final = result_event(events)
+    result = final or {}
+    return {
+        **summary(meta),
+        "output": render(events),
+        "result": result.get("result"),
+        "structured": result.get("structured_output"),
+        "claudeSessionId": meta["claudeSessionId"],
+        "costUsd": result.get("total_cost_usd"),
+        "usage": usage(final),
+    }
+
+
+def stop_session(_body, run_id):
+    meta = settle(run_id, read_meta(run_id))
+    if meta["status"] == "running":
+        update_meta(run_id, stopped=True)
+        if meta.get("container") is None:
+            try:
+                os.killpg(meta["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            remove_containers(meta["container"], meta.get("sidecar"))
+    return {"id": run_id}
+
+
+def start_session(body):
+    request = RunRequest.parse(body)
+    token = agent_token()
+    require_docker()
+    image = require_image()
+    conversation_id = request.conversation_id()
+    with start_lock:
+        if any(meta["status"] == "running" and meta["claudeSessionId"] == conversation_id for meta in all_runs()):
+            raise Rejected(422, "that conversation is still running; stop it or wait")
+        run_id, process = spawn(request, conversation_id, token, image)
+    threading.Thread(target=reap, args=(run_id, process), daemon=True).start()
+    return {"id": run_id, "claudeSessionId": conversation_id}
+
+
+def start_sidecar(run_id):
+    started = docker(*sidecar_argv(run_id)[1:])
+    if started.returncode != 0:
+        raise Rejected(503, f"the docker sidecar did not start: {started.stderr.strip()[:300]}")
+    return sidecar_name(run_id)
+
+
+def write_attachments(cwd, attachments):
+    """Puts the task's files in <cwd>/.weworkai/attachments/<folder>/, replacing the last run's."""
+    if attachments is None:
+        return
+    name, files = attachments
+    folder = cwd / ".weworkai" / "attachments" / name
+    # An agent that can write may have swapped a folder on the way for a symlink; checked
+    # before the last run's copy is deleted, so nothing outside the working directory goes.
+    if cwd not in folder.resolve().parents:
+        raise Rejected(422, "the attachments folder leads outside the working directory")
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True, exist_ok=True)
+    for file_name, content in files.items():
+        (folder / file_name).write_bytes(content)
+    if git(cwd, "rev-parse", "--git-dir").returncode == 0:
+        exclude_state_folder(cwd)
+
+
+def spawn(request, conversation_id, token, image):
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    write_attachments(request.cwd, request.attachments)
+    run_id = secrets.token_hex(4)
+    profile = PROFILES[request.profile]
+    git_dir = git_directory(request.cwd)
+    if git_dir is not None and profile.git_writable:
+        # A bind mount needs its source; Docker would otherwise create it owned by root.
+        (git_dir / "hooks").mkdir(exist_ok=True)
+    environment = {"CLAUDE_CODE_OAUTH_TOKEN": token, **git_identity(request.cwd)}
+    sidecar = start_sidecar(run_id) if profile.docker else None
+    argv = docker_argv(run_id, request, conversation_id, image, mounts(request.cwd, profile, git_dir), sidecar,
+                       environment.keys())
+    meta_path, log_path = run_paths(run_id)
+    prompt_path = RUNS_DIR / f"{run_id}.prompt"
+    prompt_path.write_text(request.prompt)
+    with (prompt_path.open("rb") as prompt, log_path.open("wb") as log,
+          (RUNS_DIR / f"{run_id}.err").open("wb") as errors):
+        # Own session, so `docker run` outlives a bridge restart and keeps writing the log.
+        process = subprocess.Popen(argv, stdin=prompt, stdout=log, stderr=errors, start_new_session=True,
+                                   env={**os.environ, **environment})
+    children[run_id] = process
+    # docker holds its own descriptor of the prompt, so the file itself is no longer needed.
+    prompt_path.unlink()
+    meta_path.write_text(json.dumps({
+        "id": run_id, "name": request.name, "cwd": str(request.cwd), "profile": request.profile,
+        "startedAt": datetime.now(timezone.utc).isoformat(), "pid": process.pid,
+        "container": container_name(run_id), "sidecar": sidecar, "claudeSessionId": conversation_id,
+    }))
+    return run_id, process
+
+
+def reap(run_id, process):
+    exit_code = process.wait()
+    update_meta(run_id, exitCode=exit_code)
+    children.pop(run_id, None)
+    settle(run_id, read_meta(run_id))
+
+
+def git(folder, *args):
+    return subprocess.run(["git", "-C", str(folder), *args], capture_output=True, text=True, timeout=30,
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+
+
+def git_output(folder, *args):
+    completed = git(folder, *args)
+    if completed.returncode != 0:
+        raise Rejected(422, completed.stderr.strip() or f"git {args[0]} failed")
+    return completed.stdout.strip()
+
+
+def base_key(branch):
+    return f"branch.{branch}.weworkaiBase"
+
+
+def exclude_state_folder(repo):
+    exclude = pathlib.Path(git_output(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude.read_text() if exclude.exists() else ""
+    if ".weworkai/" not in existing.splitlines():
+        exclude.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n") + ".weworkai/\n")
+
+
+def create_worktree(body):
+    repo = allowed_folder(text_field(body, "repo", 1000))
+    name = text_field(body, "name", 40)
+    if not WORKTREE_NAME.match(name):
+        raise Rejected(422, "invalid worktree name")
+    if git(repo, "rev-parse", "--show-toplevel").stdout.strip() != str(repo):
+        raise Rejected(422, f"{repo} is not the root of a git repository")
+
+    exclude_state_folder(repo)
+    path = repo / ".weworkai" / "worktrees" / name
+    branch = f"weworkai/{name}"
+    if not path.exists():
+        branch_exists = git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
+        head = git_output(repo, "rev-parse", "HEAD")
+        if branch_exists:
+            git_output(repo, "worktree", "add", str(path), branch)
+        else:
+            git_output(repo, "worktree", "add", "-b", branch, str(path), head)
+        if git(repo, "config", "--get", base_key(branch)).returncode != 0:
+            git_output(repo, "config", base_key(branch), head)
+    return {"path": str(path), "branch": branch, "base": git_output(repo, "config", "--get", base_key(branch))}
+
+
+def worktree_diff(body):
+    path = allowed_folder(text_field(body, "path", 1000))
+    if path.parent.name != "worktrees" or path.parent.parent.name != ".weworkai":
+        raise Rejected(422, f"{path} is not a weworkai worktree")
+    branch = git_output(path, "rev-parse", "--abbrev-ref", "HEAD")
+    base = git_output(path, "config", "--get", base_key(branch))
+    # Against the working tree, so committed and uncommitted changes both show.
+    parts = [git_output(path, "diff", base)]
+    for untracked in git_output(path, "ls-files", "--others", "--exclude-standard").splitlines():
+        parts.append(git(path, "diff", "--no-index", "--", "/dev/null", untracked).stdout.strip())
+    diff = "\n".join(part for part in parts if part)
+    return {"diff": diff[:MAX_DIFF], "truncated": len(diff) > MAX_DIFF}
+
+
+def list_folders(body):
+    """The allowed roots, or the subfolders of one allowed folder, for the app's folder picker."""
+    if not body.get("path"):
+        return {"path": None, "parent": None, "folders": [folder_entry(root) for root in ROOTS]}
+    folder = allowed_folder(text_field(body, "path", 1000))
+    children = sorted((child for child in folder.iterdir() if child.is_dir() and not child.name.startswith(".")),
+                      key=lambda child: child.name.lower())
+    return {"path": short_path(folder),
+            "parent": None if folder in ROOTS else short_path(folder.parent),
+            "folders": [folder_entry(child) for child in children[:MAX_FOLDERS]]}
+
+
+def folder_entry(folder):
+    return {"name": folder.name, "path": short_path(folder), "git": (folder / ".git").exists()}
+
+
+def run_claude(*args, cwd=None):
+    return subprocess.run(["claude", *args], capture_output=True, text=True, timeout=30, cwd=cwd)
+
+
+def auth_status(_body):
+    # Logged-out status still prints JSON (with loggedIn false) but exits non-zero.
+    status = json.loads(run_claude("auth", "status", "--json").stdout)
+    return {key: value for key, value in status.items() if key in STATUS_FIELDS}
+
+
+def models(_body):
+    return {"version": agent_version(), "models": MODELS, "efforts": EFFORTS}
+
+
+GET_ROUTES = [
+    (re.compile(r"^/auth/status$"), auth_status),
+    (re.compile(r"^/models$"), models),
+    (re.compile(r"^/sessions$"), list_sessions),
+    (re.compile(r"^/sessions/([0-9a-f]{8})$"), show_session),
+    (re.compile(r"^/worktrees/diff$"), worktree_diff),
+    (re.compile(r"^/folders$"), list_folders),
+]
+POST_ROUTES = [
+    (re.compile(r"^/sessions$"), start_session),
+    (re.compile(r"^/sessions/([0-9a-f]{8})/stop$"), stop_session),
+    (re.compile(r"^/worktrees$"), create_worktree),
+    (re.compile(r"^/worktrees/diff$"), worktree_diff),
+]
+
+
+class Handler(BaseHTTPRequestHandler):
+    token = None
+
+    def do_GET(self):
+        self.dispatch(GET_ROUTES)
+
+    def do_POST(self):
+        self.dispatch(POST_ROUTES)
+
+    def dispatch(self, routes):
+        supplied = self.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied.encode(), f"Bearer {self.token}".encode()):
+            return self.reply(401, {"error": "unauthorized"})
+
+        route, _, query = self.path.partition("?")
+        for pattern, handler in routes:
+            match = pattern.match(route)
+            if match:
+                return self.run(handler, match.groups(), query)
+        self.reply(404, {"error": "not found"})
+
+    def run(self, handler, path_args, query):
+        try:
+            # GET parameters arrive in the query string; both end up in one body.
+            body = {**{key: values[0] for key, values in parse_qs(query).items()}, **self.read_body()}
+            self.reply(200, handler(body, *path_args))
+        except Rejected as error:
+            self.reply(error.code, {"error": str(error)})
+        except FileNotFoundError:
+            self.reply(502, {"error": "claude, git or docker not found on PATH"})
+        except (subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+            self.reply(502, {"error": f"command failed: {type(error).__name__}"})
+        except Exception as error:
+            # Keeps the reply JSON (and the app's message readable) when something unforeseen breaks.
+            self.reply(500, {"error": f"bridge error: {type(error).__name__}"})
+            raise
+
+    def read_body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            raise Rejected(413, "request too large")
+        if length == 0:
+            return {}
+        try:
+            body = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError:
+            raise Rejected(422, "expected a JSON object")
+        if not isinstance(body, dict):
+            raise Rejected(422, "expected a JSON object")
+        return body
+
+    def reply(self, code, body):
+        payload = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        print(f"claude_bridge: {self.address_string()} {format % args}")
+
+
+def load_token():
+    if not TOKEN_FILE.exists():
+        TOKEN_FILE.write_text(secrets.token_urlsafe(32))
+        TOKEN_FILE.chmod(0o600)
+    return TOKEN_FILE.read_text().strip()
+
+
+class FakeDocker:
+    """Stands in for the docker CLI: records each call and answers from `replies` (args prefix → result)."""
+
+    def __init__(self, replies=None):
+        self.calls = []
+        self.replies = replies or {}
+
+    def __call__(self, *args, timeout=60):
+        self.calls.append(list(args))
+        code, stdout = next((reply for prefix, reply in self.replies.items() if tuple(args[:len(prefix)]) == prefix),
+                            (0, ""))
+        return subprocess.CompletedProcess(["docker", *args], code, stdout, "")
+
+
+def mount_flags(argv):
+    return [argv[index + 1] for index, flag in enumerate(argv) if flag == "--mount"]
+
+
+def env_flags(argv):
+    return [argv[index + 1] for index, flag in enumerate(argv) if flag == "--env"]
+
+
+def scratch_repository(scratch):
+    """A repo with one commit and a weworkai worktree, laid out like create_worktree's."""
+    repo = scratch / "repo"
+    repo.mkdir()
+    quiet = {"capture_output": True, "check": True}
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], **quiet)
+    git_output(repo, "config", "user.name", "Ada Lovelace")
+    git_output(repo, "config", "user.email", "ada@example.com")
+    git_output(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    worktree = repo / ".weworkai" / "worktrees" / "abcd1234"
+    git_output(repo, "worktree", "add", "-q", "-b", "weworkai/abcd1234", str(worktree))
+    return repo.resolve(), worktree.resolve()
+
+
+def self_test():
+    global ROOTS, RUNS_DIR, AGENT_TOKEN_FILE, docker
+    real_docker = docker
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch = pathlib.Path(scratch).resolve()
+        ROOTS = [scratch]
+        RUNS_DIR = scratch / "runs"
+        AGENT_TOKEN_FILE = scratch / "oauth-token"
+        body = {"name": "cph-abcdefgh", "cwd": str(scratch), "model": "haiku", "prompt": "-x Plan it",
+                "profile": "planner", "effort": "low", "jsonSchema": {"type": "object"}}
+        conversation = str(uuid.uuid4())
+
+        planner = claude_argv(RunRequest.parse(body), conversation)
+        assert planner[:6] == ["claude", "-p", "--output-format", "stream-json", "--verbose",
+                               "--dangerously-skip-permissions"], planner
+        assert "-x Plan it" not in planner and "--" not in planner, planner
+        assert planner[planner.index("--session-id") + 1] == conversation
+        assert json.loads(planner[planner.index("--json-schema") + 1]) == {"type": "object"}
+        assert planner[planner.index("--effort") + 1] == "low"
+        coder = claude_argv(RunRequest.parse({**body, "profile": "coder", "resume": conversation}), "unused")
+        assert "--session-id" not in coder and coder[coder.index("--resume") + 1] == conversation
+        fork_request = RunRequest.parse({**body, "resume": conversation, "fork": True})
+        fork_id = fork_request.conversation_id()
+        assert fork_id != conversation and CONVERSATION_ID.match(fork_id)
+        fork = claude_argv(fork_request, fork_id)
+        assert fork[fork.index("--resume") + 1] == conversation and "--fork-session" in fork, fork
+        assert fork[fork.index("--session-id") + 1] == fork_id, fork
+        assert RunRequest.parse({**body, "resume": conversation}).conversation_id() == conversation
+
+        assert RunRequest.parse({**body, "prompt": "é" * MAX_PROMPT}).prompt == "é" * MAX_PROMPT
+        escaped = {**body, "prompt": "\0" * MAX_PROMPT, "systemPrompt": "\0" * MAX_SYSTEM_PROMPT}
+        assert len(json.dumps(escaped).encode()) < MAX_BODY
+
+        for bad in [{"profile": "admin"}, {"model": "gpt"}, {"effort": "huge"}, {"name": "rm -rf"},
+                    {"cwd": "/etc"}, {"cwd": f"{scratch}/missing"}, {"jsonSchema": "[]"},
+                    {"jsonSchema": {"x": "y" * MAX_SCHEMA}}, {"resume": "../../x"}, {"prompt": ""},
+                    {"prompt": "x" * (MAX_PROMPT + 1)}, {"systemPrompt": 3},
+                    {"systemPrompt": "x" * (MAX_SYSTEM_PROMPT + 1)}, {"fork": True}, {"fork": "yes"},
+                    {"fork": 1, "resume": conversation}]:
+            try:
+                RunRequest.parse({**body, **bad})
+            except Rejected as error:
+                assert error.code == 422
+            else:
+                raise AssertionError(f"accepted {bad}")
+
+        test_docker_argv(scratch, body, conversation)
+        test_prerequisites()
+        test_folders(scratch)
+
+        png = base64.b64encode(b"png").decode()
+        files = {"folder": "abcd1234", "files": [{"name": "mock up (1).png", "content": png}]}
+        attached = RunRequest.parse({**body, "attachments": files})
+        assert attached.attachments == ("abcd1234", {"mock up (1).png": b"png"})
+        assert RunRequest.parse(body).attachments is None
+        for bad in [[], {"folder": "../x", "files": []}, {"folder": "a", "files": "x"},
+                    *({"folder": "a", "files": [{"name": name, "content": ""}]}
+                      for name in ["../x", ".env", "a/b", "x\n"]),
+                    {"folder": "a", "files": [{"name": "x", "content": "not base64!"}]},
+                    {"folder": "a", "files": [{"name": "x"}]}]:
+            try:
+                parse_attachments(bad)
+            except Rejected as error:
+                assert error.code == 422
+            else:
+                raise AssertionError(f"accepted attachments {bad}")
+
+        repo = pathlib.Path(scratch).resolve() / "attached"
+        repo.mkdir()
+        folder = repo / ".weworkai" / "attachments" / "abcd1234"
+        write_attachments(repo, attached.attachments)
+        assert (folder / "mock up (1).png").read_bytes() == b"png"
+        # A file removed from the task is gone on the next run.
+        write_attachments(repo, ("abcd1234", {}))
+        assert list(folder.iterdir()) == []
+        outside = pathlib.Path(scratch).resolve() / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("x")
+        folder.rmdir()
+        folder.symlink_to(outside)
+        try:
+            write_attachments(repo, attached.attachments)
+        except Rejected as error:
+            assert error.code == 422
+        else:
+            raise AssertionError("wrote attachments through a symlink")
+        assert [path.name for path in outside.iterdir()] == ["keep"]
+
+        events = [
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "Looking at the log."},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "git log --oneline\nmore"}},
+                {"type": "tool_use", "name": "StructuredOutput", "input": {"answer": "x"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "is_error": True, "content": "Permission denied"}]}},
+            {"type": "system", "subtype": "permission_denied", "tool_name": "Bash", "message": "Denied"},
+            {"type": "result", "is_error": False, "num_turns": 3, "total_cost_usd": 0.0072,
+             "result": "{\"answer\":\"init\"}", "structured_output": {"answer": "init"}},
+        ]
+        assert render(events) == ("Looking at the log.\n→ Bash: git log --oneline\n  ✗ Permission denied\n"
+                                  "  ✗ Bash denied: not allowed for this agent\n"
+                                  "── finished · 3 turns · $0.0072\n{\"answer\":\"init\"}"), render(events)
+        assert len(render([{"type": "result", "result": "x" * (MAX_OUTPUT * 2)}])) == MAX_OUTPUT
+        assert usage(None) is None
+        assert usage({**events[-1], "duration_ms": 4200, "usage": {
+            "input_tokens": 12, "output_tokens": 340, "cache_read_input_tokens": 5600,
+            "cache_creation_input_tokens": 780}}) == {
+            "inputTokens": 12, "outputTokens": 340, "cacheReadTokens": 5600, "cacheCreationTokens": 780,
+            "costUsd": 0.0072, "durationMs": 4200, "turns": 3}
+        assert usage({"type": "result"})["inputTokens"] == 0
+
+        assert process_alive(os.getpid())
+        # A run's pid reused by another user's process (pid 1 here) means the run ended.
+        if os.geteuid() != 0:
+            assert not process_alive(1)
+
+        assert final_status({"stopped": True}, events[-1]) == "stopped"
+        assert final_status({"exitCode": 0}, events[-1]) == "done"
+        assert final_status({"exitCode": 1}, events[-1]) == "failed"
+        assert final_status({}, {"is_error": True}) == "failed"
+        assert final_status({}, None) == "failed"
+
+        log = scratch / "run.jsonl"
+        log.write_text(json.dumps(events[-1]) + "\n{\"type\": \"assis")
+        assert result_event(read_events(log))["structured_output"] == {"answer": "init"}
+        try:
+            test_runs(scratch, body, conversation)
+            test_containers(conversation)
+        finally:
+            docker = real_docker
+    print("claude_bridge self-test passed")
+
+
+def test_docker_argv(scratch, body, conversation):
+    repo, worktree = scratch_repository(scratch)
+    git_dir = git_directory(worktree)
+    assert git_dir == repo / ".git" and git_directory(repo) == git_dir and git_directory(scratch) is None
+    identity = git_identity(worktree)
+    assert identity == {"GIT_AUTHOR_NAME": "Ada Lovelace", "GIT_AUTHOR_EMAIL": "ada@example.com",
+                        "GIT_COMMITTER_NAME": "Ada Lovelace", "GIT_COMMITTER_EMAIL": "ada@example.com"}, identity
+    names = ["CLAUDE_CODE_OAUTH_TOKEN", *identity]
+
+    def argv(profile, folder, sidecar=None):
+        request = RunRequest.parse({**body, "profile": profile, "cwd": str(folder)})
+        run_mounts = mounts(request.cwd, PROFILES[profile], git_directory(request.cwd))
+        return docker_argv("0123abcd", request, conversation, "weworkai-agent:test", run_mounts, sidecar, names)
+
+    def bind(path, read_only):
+        return f"type=bind,source={path},target={path}" + (",readonly" if read_only else "")
+
+    volume = f"type=volume,source={CONVERSATIONS_VOLUME},target={CONVERSATIONS_DIR}"
+    planner = argv("planner", repo)
+    assert planner[:6] == ["docker", "run", "--rm", "--interactive", "--init", "--name"], planner
+    assert planner[planner.index("--name") + 1] == "cph-0123abcd"
+    assert planner[planner.index("--network") + 1] == "bridge"
+    assert planner[planner.index("--memory") + 1] == MEMORY and planner[planner.index("--cpus") + 1] == CPUS
+    assert planner[planner.index("--workdir") + 1] == str(repo)
+    image_at = planner.index("weworkai-agent:test")
+    assert planner[image_at + 1:] == claude_argv(RunRequest.parse({**body, "cwd": str(repo)}), conversation)
+    # The repo's own .git sits inside the read-only repo mount.
+    assert mount_flags(planner) == [volume, bind(repo, True)], mount_flags(planner)
+    # Secrets go by name: docker reads the values from its own environment.
+    assert env_flags(planner) == names and not any("=" in name for name in env_flags(planner))
+    assert "--privileged" not in planner and "/var/run/docker.sock" not in " ".join(planner)
+
+    assert mount_flags(argv("reviewer", worktree)) == [volume, bind(worktree, True), bind(git_dir, True)]
+    assert mount_flags(argv("coder", worktree)) == [
+        volume, bind(worktree, False), bind(git_dir, False), bind(git_dir / "config", True),
+        bind(git_dir / "hooks", True)], mount_flags(argv("coder", worktree))
+    assert mount_flags(argv("custom", repo)) == [
+        volume, bind(repo, False), bind(git_dir / "config", True), bind(git_dir / "hooks", True)]
+    assert mount_flags(argv("custom", scratch)) == [volume, bind(scratch, False)]
+
+    qa = argv("qa", worktree, sidecar="cph-0123abcd-dind")
+    assert mount_flags(qa) == [volume, bind(worktree, False), bind(git_dir, True)], mount_flags(qa)
+    assert qa[qa.index("--network") + 1] == "container:cph-0123abcd-dind"
+    assert f"DOCKER_HOST={SIDECAR_DOCKER_HOST}" in env_flags(qa)
+    sidecar = sidecar_argv("0123abcd")
+    assert sidecar[:6] == ["docker", "run", "--detach", "--rm", "--privileged", "--name"], sidecar
+    assert sidecar[sidecar.index("--name") + 1] == "cph-0123abcd-dind"
+    assert sidecar[sidecar.index(DIND_IMAGE) + 1:] == ["dockerd", "--host=tcp://127.0.0.1:2375", "--tls=false"]
+
+
+def test_folders(scratch):
+    (scratch / "folders" / "Repo" / ".git").mkdir(parents=True)
+    (scratch / "folders" / "plain").mkdir()
+    (scratch / "folders" / ".hidden").mkdir()
+    (scratch / "folders" / "file").write_text("x")
+    assert list_folders({})["folders"] == [folder_entry(scratch)]
+    listing = list_folders({"path": str(scratch / "folders")})
+    assert [(entry["name"], entry["git"]) for entry in listing["folders"]] == [("plain", False), ("Repo", True)]
+    assert listing["parent"] == short_path(scratch)
+    assert list_folders({"path": str(scratch)})["parent"] is None
+    for bad in ["/etc", str(scratch / "folders" / "file"), str(scratch / "folders" / ".." / "..")]:
+        try:
+            list_folders({"path": bad})
+        except Rejected as error:
+            assert error.code == 422
+        else:
+            raise AssertionError(f"listed {bad}")
+
+
+def test_prerequisites():
+    global docker
+    AGENT_TOKEN_FILE.unlink(missing_ok=True)
+    for content in [None, "  \n", "sk-ant-api03-key\n"]:
+        if content is not None:
+            AGENT_TOKEN_FILE.write_text(content)
+        try:
+            agent_token()
+        except Rejected as error:
+            assert error.code == 422 and "claude setup-token" in str(error), error
+        else:
+            raise AssertionError("ran without a token")
+    AGENT_TOKEN_FILE.write_text("sk-ant-oat01-secret\n")
+    assert agent_token() == "sk-ant-oat01-secret"
+    AGENT_TOKEN_FILE.write_text("Your OAuth token (valid for 1 year):\n\nsk-ant-oat01-secret\n\nStore it.\n")
+    assert agent_token() == "sk-ant-oat01-secret"
+
+    docker = FakeDocker({("info",): (1, "")})
+    try:
+        require_docker()
+    except Rejected as error:
+        assert error.code == 503 and "Docker is not running" in str(error)
+    else:
+        raise AssertionError("Docker reported running")
+    assert image_tag().startswith(f"{IMAGE_NAME}:") and image_tag() == image_tag()
+    assert re.match(r"^\d+\.\d+\.\d+ \(Claude Code\)$", agent_version()), agent_version()
+
+
+def wait_until(condition):
+    deadline = time.time() + 5
+    while not condition():
+        assert time.time() < deadline, "timed out"
+        time.sleep(0.05)
+
+
+def test_runs(scratch, body, conversation):
+    global docker_argv, docker
+    real_argv, real_popen = docker_argv, subprocess.Popen
+    popen_environments = []
+
+    def slow_popen(*args, **kwargs):
+        # Widens the window between the "still running" check and the new run's metadata.
+        if args[0][0] == "sh":
+            time.sleep(0.2)
+            popen_environments.append(kwargs["env"])
+        return real_popen(*args, **kwargs)
+
+    calls = []
+    docker = FakeDocker()
+    docker_argv = lambda *args: calls.append(args) or ["sh", "-c", "cat; sleep 1"]
+    subprocess.Popen = slow_popen
+    outcomes = []
+
+    def start():
+        try:
+            outcomes.append(start_session({**body, "resume": conversation}))
+        except Rejected as error:
+            outcomes.append(error)
+
+    try:
+        starters = [threading.Thread(target=start) for _ in range(2)]
+        for starter in starters:
+            starter.start()
+        for starter in starters:
+            starter.join()
+    finally:
+        docker_argv, subprocess.Popen = real_argv, real_popen
+
+    started = [outcome for outcome in outcomes if isinstance(outcome, dict)]
+    assert len(started) == 1, outcomes
+    run_id = started[0]["id"]
+    # A fork leaves the running conversation alone, so it may start beside it.
+    assert current_meta(run_id)["status"] == "running"
+    docker_argv = lambda *args: ["sh", "-c", "cat >/dev/null"]
+    try:
+        forked = start_session({**body, "resume": conversation, "fork": True})
+    finally:
+        docker_argv = real_argv
+    assert forked["claudeSessionId"] != conversation, forked
+    wait_until(lambda: current_meta(forked["id"])["status"] != "running")
+
+    # Attachments are on disk before the container starts, inside its read-only folder mount.
+    seen = []
+    attachment = scratch / ".weworkai" / "attachments" / "abcd1234" / "spec.md"
+    docker_argv = lambda *args: seen.append((attachment.read_bytes(), args[4])) or ["sh", "-c", "cat >/dev/null"]
+    try:
+        attached = start_session({**body, "attachments": {"folder": "abcd1234", "files": [
+            {"name": "spec.md", "content": base64.b64encode(b"# Spec").decode()}]}})
+    finally:
+        docker_argv = real_argv
+    assert seen == [(b"# Spec", [Mount(scratch, read_only=True)])], seen
+    wait_until(lambda: current_meta(attached["id"])["status"] != "running")
+    # The token reaches docker's environment, by name in argv only.
+    assert popen_environments[0]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-secret"
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in calls[0][-1] and "sk-ant" not in repr(calls[0][:-1]), calls[0]
+    assert not list(RUNS_DIR.glob("*.prompt")), "the prompt file outlived the start"
+    meta = read_meta(run_id)
+    assert meta["container"] == f"cph-{run_id}" and meta["sidecar"] is None
+    assert "sk-ant" not in run_paths(run_id)[0].read_text()
+    wait_until(lambda: current_meta(run_id)["status"] != "running")
+    assert run_paths(run_id)[1].read_text() == body["prompt"]
+    assert run_id not in children
+    # The last event is when the stream was last written, not when the run started.
+    listed = summary(current_meta(run_id))
+    assert listed["lastEventAt"] >= listed["startedAt"], listed
+
+    # The listing reads a finished run's file once.
+    run_paths(run_id)[0].write_text("not json")
+    assert sorted(meta["id"] for meta in all_runs()) == sorted([run_id, forked["id"], attached["id"]])
+
+    old = time.time() - KEEP_SECONDS - 60
+    for run_id, extra in [("0000000a", {"status": "done"}), ("0000000b", {"status": "done"}),
+                          ("0000000c", {"pid": os.getpid()})]:
+        run_paths(run_id)[0].write_text(json.dumps({"id": run_id, "claudeSessionId": conversation, **extra}))
+        (RUNS_DIR / f"{run_id}.err").write_text("")
+    for path in [*RUNS_DIR.glob("0000000a.*"), *RUNS_DIR.glob("0000000c.*")]:
+        os.utime(path, (old, old))
+    prune_runs(time.time())
+    remaining = {path.name for path in RUNS_DIR.iterdir()}
+    assert not any(name.startswith("0000000a") for name in remaining), remaining
+    assert {"0000000b.json", "0000000c.json", "0000000c.err"} <= remaining, remaining
+    assert "0000000a" not in finished_runs
+
+
+def test_containers(conversation):
+    """Runs an earlier bridge process started: found, stopped and cleaned up by container."""
+    global docker
+
+    def container_run(run_id):
+        run_paths(run_id)[0].write_text(json.dumps({
+            "id": run_id, "claudeSessionId": conversation, "pid": 1, "container": container_name(run_id),
+            "sidecar": sidecar_name(run_id)}))
+
+    container_run("0000000d")
+    docker = FakeDocker({("inspect",): (0, "true\n")})
+    assert current_meta("0000000d")["status"] == "running"
+    assert docker.calls == [["inspect", "--format", "{{.State.Running}}", "cph-0000000d"]], docker.calls
+    stop_session({}, "0000000d")
+    assert ["rm", "--force", "--volumes", "cph-0000000d", "cph-0000000d-dind"] in docker.calls, docker.calls
+    assert current_meta("0000000d")["status"] == "stopped"
+
+    # Gone while no bridge watched it: finished, and its sidecar removed.
+    container_run("0000000e")
+    docker = FakeDocker({("inspect",): (1, "")})
+    assert current_meta("0000000e")["status"] == "failed"
+    assert docker.calls[-1] == ["rm", "--force", "--volumes", "cph-0000000e-dind"], docker.calls
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        sys.exit(0)
+    if sys.argv[1:] == ["--build-image"]:
+        sys.exit(0 if build_image(image_tag()) else 1)
+    Handler.token = load_token()
+    prune_runs(time.time())
+    # Built before listening, so the first runs don't wait for it (or retry past it).
+    try:
+        require_docker()
+        if docker("image", "inspect", image_tag()).returncode != 0:
+            build_image(image_tag())
+    except Rejected as error:
+        print(f"claude_bridge: {error}; the agent image is built once Docker runs", flush=True)
+    if not AGENT_TOKEN_FILE.exists():
+        print(f"claude_bridge: agents cannot start until you run `claude setup-token` and save the token to "
+              f"{short_path(AGENT_TOKEN_FILE)} (chmod 600)", flush=True)
+    print(f"claude_bridge listening on 127.0.0.1:{PORT}; agents may run under {', '.join(map(str, ROOTS))}")
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Stand-in for bin/claude_bridge in e2e runs: same HTTP API and token file, no claude, no Docker.
+
+Each run is "running" for FAKE_BRIDGE_RUN_SECONDS (default 1), then finishes with a canned
+structured result picked by its profile:
+
+  planner → a two-step plan with one question; resumed planner → revised plan, no questions
+  coder   → done                 ("[fake:blocked]" in the prompt → blocked with a question)
+  reviewer, qa → no findings     ("[fake:findings]" in the prompt → two findings)
+  question (planner / reviewer run without a jsonSchema, forked or not)
+          → "Fake answer to: <first line after the prompt's "# Question" heading>"
+  any     → "[fake:fail]" in the prompt → the run fails
+            "[fake:slow]" in the prompt → the run is "running" for SLOW_RUN_SECONDS (8)
+            "[fake:hang]" in the prompt → the run is "running" until stopped and writes nothing
+                                          after it starts (its lastEventAt stays its start)
+
+A finished run (done or failed) reports the usage in USAGE for its profile (a question's: "question").
+
+Listens on 0.0.0.0 (it runs inside the e2e Docker network, never on the host).
+"""
+
+import hmac
+import json
+import math
+import os
+import pathlib
+import re
+import secrets
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+PORT = int(os.environ.get("CLAUDE_BRIDGE_PORT", "4141"))
+TOKEN_FILE = pathlib.Path(__file__).resolve().parent.parent / ".claude-bridge-token"
+RUN_SECONDS = float(os.environ.get("FAKE_BRIDGE_RUN_SECONDS", "1"))
+SLOW_RUN_SECONDS = 8
+MODELS = [{"id": "haiku", "label": "Haiku (latest)"}, {"id": "sonnet", "label": "Sonnet (latest)"},
+          {"id": "opus", "label": "Opus (latest)"}, {"id": "claude-opus-5-5", "label": "Opus 5.5"}]
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+PROFILES = {"planner", "coder", "reviewer", "qa", "custom"}
+# The real bridge's limits.
+MAX_PROMPT = 400_000
+# Attachments (at most 100 MB per task) arrive base64 encoded, a third larger.
+MAX_BODY = 3_000_000 + 100_000_000 * 4 // 3 + 1_000_000
+
+# Tokens, USD and turns a finished run reports, in the shape of bin/claude_bridge's `usage`.
+USAGE = {
+    "planner": (4_200, 1_900, 38_400, 6_100, 0.0912, 6),
+    "coder": (9_800, 6_400, 182_000, 21_500, 0.4127, 23),
+    "reviewer": (5_100, 1_200, 64_000, 8_800, 0.1348, 9),
+    "qa": (5_100, 1_200, 64_000, 8_800, 0.1348, 9),
+    "custom": (2_000, 900, 20_000, 3_000, 0.0450, 4),
+    "question": (1_100, 320, 12_000, 2_400, 0.0215, 2),
+}
+
+runs = {}
+lock = threading.Lock()
+
+
+class Rejected(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def plan(revised):
+    steps = [
+        {"id": "s1", "title": "Add the Greeting module",
+         "description": "A pure function keeps the greeting testable.",
+         "changes": [{"path": "lib/greeting.ex", "diff": (
+             "--- /dev/null\n+++ b/lib/greeting.ex\n@@ -0,0 +1,3 @@\n"
+             "+defmodule Greeting do\n+  def hello(name), do: \"Hello, #{name}!\"\n+end\n")}]},
+        {"id": "s2", "title": "Cover it with a test",
+         "description": "Locks the format in place.",
+         "changes": [{"path": "test/greeting_test.exs", "diff": (
+             "--- /dev/null\n+++ b/test/greeting_test.exs\n@@ -0,0 +1,5 @@\n"
+             "+defmodule GreetingTest do\n+  use ExUnit.Case\n"
+             "+  test \"greets\", do: assert Greeting.hello(\"Ada\") == \"Hello, Ada!\"\n+end\n")}]},
+    ]
+    questions = [] if revised else [
+        {"id": "q1", "question": "Should the greeting be localized?", "options": ["English only", "Use gettext"]}]
+    summary = "Revised plan: add a greeting helper." if revised else "Add a greeting helper with a test."
+    return {"summary": summary, "steps": steps, "questions": questions}
+
+
+def findings(with_findings):
+    found = [
+        {"id": "f1", "severity": "high", "title": "Greeting crashes on nil", "path": "lib/greeting.ex",
+         "line": 2, "details": "`hello(nil)` raises.", "reproduction": "Greeting.hello(nil)",
+         "evidence": "** (ArgumentError)"},
+        {"id": "f2", "severity": "low", "title": "Missing doc", "path": "lib/greeting.ex", "line": 1,
+         "details": "No @moduledoc.", "reproduction": "mix docs", "evidence": "warning: no docs"},
+    ] if with_findings else []
+    return {"summary": f"{len(found)} findings.", "findings": found}
+
+
+def answer(prompt):
+    question = prompt.partition("# Question\n")[2].strip()
+    return f"Fake answer to: {question.splitlines()[0] if question else '(no question)'}"
+
+
+def outcome(prompt, profile, resumed):
+    if profile == "planner":
+        return plan(resumed)
+    if profile in ("reviewer", "qa"):
+        return findings("[fake:findings]" in prompt)
+    if profile == "coder" and "[fake:blocked]" in prompt:
+        return {"status": "blocked", "summary": "Need a decision.",
+                "questions": [{"id": "q1", "question": "Which database?", "options": ["Postgres", "SQLite"]}]}
+    return {"status": "done", "summary": "Implemented the plan.", "questions": []}
+
+
+def start_session(body):
+    for key in ("name", "cwd", "model", "prompt", "profile"):
+        if not isinstance(body.get(key), str) or not body[key]:
+            raise Rejected(422, f"invalid {key}")
+    if body["profile"] not in PROFILES:
+        raise Rejected(422, f"profile {body['profile']} is not allowed")
+    if len(body["prompt"]) > MAX_PROMPT:
+        raise Rejected(422, "invalid prompt")
+    fork = body.get("fork", False)
+    if not isinstance(fork, bool) or (fork and body.get("resume") is None):
+        raise Rejected(422, "invalid fork: it needs a resume")
+    run_id = secrets.token_hex(4)
+    resumed = body.get("resume") is not None
+    asked = body.get("jsonSchema") is None and body["profile"] in ("planner", "reviewer")
+    structured = None if asked else outcome(body["prompt"], body["profile"], resumed)
+    text = answer(body["prompt"]) if asked else json.dumps(structured)
+    conversation = body.get("resume") if resumed and not fork else str(uuid.uuid4())
+    hang = "[fake:hang]" in body["prompt"]
+    seconds = math.inf if hang else SLOW_RUN_SECONDS if "[fake:slow]" in body["prompt"] else RUN_SECONDS
+    with lock:
+        runs[run_id] = {
+            "id": run_id, "name": body["name"], "cwd": body["cwd"],
+            "startedAt": datetime.now(timezone.utc).isoformat(), "finishAt": time.time() + seconds,
+            "failed": "[fake:fail]" in body["prompt"], "claudeSessionId": conversation,
+            "stopped": False, "structured": structured, "text": text, "seconds": seconds, "hang": hang,
+            "usage": USAGE["question" if asked else body["profile"]],
+        }
+    return {"id": run_id, "claudeSessionId": runs[run_id]["claudeSessionId"]}
+
+
+def status(run):
+    if run["stopped"]:
+        return "stopped"
+    if time.time() < run["finishAt"]:
+        return "running"
+    return "failed" if run["failed"] else "done"
+
+
+def find(run_id):
+    run = runs.get(run_id)
+    if run is None:
+        raise Rejected(404, "session not found")
+    return run
+
+
+def last_event_at(run):
+    if run["hang"]:
+        return run["startedAt"]
+    return datetime.fromtimestamp(min(time.time(), run["finishAt"]), timezone.utc).isoformat()
+
+
+def summary(run):
+    return {key: run[key] for key in ("id", "name", "cwd", "startedAt")} | {
+        "status": status(run), "lastEventAt": last_event_at(run)}
+
+
+def usage(run):
+    input_tokens, output_tokens, cache_read, cache_creation, cost, turns = run["usage"]
+    return {"inputTokens": input_tokens, "outputTokens": output_tokens, "cacheReadTokens": cache_read,
+            "cacheCreationTokens": cache_creation, "costUsd": cost, "durationMs": int(run["seconds"] * 1000),
+            "turns": turns}
+
+
+def show_session(_body, run_id):
+    run = find(run_id)
+    state = status(run)
+    finished = state in ("done", "failed")
+    result = run["text"] if state == "done" else ("Fake failure." if finished else None)
+    return summary(run) | {
+        "output": "→ Read: README.md\n" + (f"── {state}\n{result}" if finished else ""),
+        "result": result,
+        "structured": run["structured"] if state == "done" else None,
+        "claudeSessionId": run["claudeSessionId"],
+        "costUsd": run["usage"][4] if finished else None,
+        "usage": usage(run) if finished else None,
+    }
+
+
+def stop_session(_body, run_id):
+    run = find(run_id)
+    if status(run) == "running":
+        run["stopped"] = True
+    return {"id": run_id}
+
+
+def create_worktree(body):
+    name = body.get("name")
+    if not isinstance(name, str) or not re.match(r"^[0-9a-z-]{1,40}$", name):
+        raise Rejected(422, "invalid worktree name")
+    return {"path": f"{body.get('repo')}/.weworkai/worktrees/{name}", "branch": f"weworkai/{name}",
+            "base": "0" * 40}
+
+
+def worktree_diff(_body):
+    # As `git diff` writes a branch: every planned file, each led by its `diff --git` line.
+    changes = [change for step in plan(False)["steps"] for change in step["changes"]]
+    diff = "".join(f"diff --git a/{change['path']} b/{change['path']}\n{change['diff']}" for change in changes)
+    return {"diff": diff, "truncated": False}
+
+
+FOLDERS = {
+    None: {"path": None, "parent": None, "folders": [{"name": "Projects", "path": "~/Projects", "git": False}]},
+    "~/Projects": {"path": "~/Projects", "parent": None, "folders": [
+        {"name": "weworkai", "path": "~/Projects/weworkai", "git": True},
+        {"name": "notes", "path": "~/Projects/notes", "git": False}]},
+}
+
+
+def list_folders(body):
+    path = body.get("path") or None
+    if path not in FOLDERS:
+        return {"path": path, "parent": "~/Projects", "folders": []}
+    return FOLDERS[path]
+
+
+GET_ROUTES = [
+    (re.compile(r"^/auth/status$"), lambda _body: {"loggedIn": True, "email": "e2e@example.com",
+                                                   "subscriptionType": "max", "authMethod": "claude.ai"}),
+    (re.compile(r"^/models$"), lambda _body: {"version": "fake", "models": MODELS, "efforts": EFFORTS}),
+    (re.compile(r"^/sessions$"), lambda _body: {"sessions": [summary(run) for run in list(runs.values())]}),
+    (re.compile(r"^/sessions/([0-9a-f]{8})$"), show_session),
+    (re.compile(r"^/worktrees/diff$"), worktree_diff),
+    (re.compile(r"^/folders$"), list_folders),
+]
+POST_ROUTES = [
+    (re.compile(r"^/sessions$"), start_session),
+    (re.compile(r"^/sessions/([0-9a-f]{8})/stop$"), stop_session),
+    (re.compile(r"^/worktrees$"), create_worktree),
+    (re.compile(r"^/worktrees/diff$"), worktree_diff),
+]
+
+
+class Handler(BaseHTTPRequestHandler):
+    token = None
+
+    def do_GET(self):
+        self.dispatch(GET_ROUTES)
+
+    def do_POST(self):
+        self.dispatch(POST_ROUTES)
+
+    def dispatch(self, routes):
+        supplied = self.headers.get("Authorization", "")
+        if not hmac.compare_digest(supplied.encode(), f"Bearer {self.token}".encode()):
+            return self.reply(401, {"error": "unauthorized"})
+        route, _, query = self.path.partition("?")
+        for pattern, handler in routes:
+            match = pattern.match(route)
+            if match:
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length > MAX_BODY:
+                        raise Rejected(413, "request too large")
+                    body = {**{key: values[0] for key, values in parse_qs(query).items()},
+                            **(json.loads(self.rfile.read(length)) if length else {})}
+                    return self.reply(200, handler(body, *match.groups()))
+                except Rejected as error:
+                    return self.reply(error.code, {"error": str(error)})
+        self.reply(404, {"error": "not found"})
+
+    def reply(self, code, body):
+        payload = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        print(f"fake_claude_bridge: {format % args}", flush=True)
+
+
+if __name__ == "__main__":
+    if not TOKEN_FILE.exists():
+        TOKEN_FILE.write_text(secrets.token_urlsafe(32))
+        TOKEN_FILE.chmod(0o600)
+    Handler.token = TOKEN_FILE.read_text().strip()
+    print(f"fake_claude_bridge listening on 0.0.0.0:{PORT}", flush=True)
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
