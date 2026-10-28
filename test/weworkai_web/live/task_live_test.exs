@@ -624,6 +624,25 @@ defmodule WeworkaiWeb.TaskLiveTest do
       assert has_element?(view, "#ask-submit[disabled]")
       assert has_element?(view, "#ask-hint", "No agent can answer yet")
     end
+
+    test "with only a connected connector, asking makes the default planner answer",
+         %{conn: conn, connector: connector} do
+      connector
+      |> Ash.Changeset.for_update(:update, %{})
+      |> Ash.Changeset.force_change_attribute(:status, :connected)
+      |> Ash.update!()
+
+      task = Board.create_task!(%{title: "Lonely"})
+      view = open(conn, ~p"/tasks/#{task.id}?tab=ask")
+
+      assert has_element?(view, "#default-answerer")
+      refute has_element?(view, "#ask-submit[disabled]")
+
+      view |> form("#ask-form", ask: %{body: "Why?"}) |> render_submit()
+
+      assert has_element?(view, "#ask-pending")
+      assert [%{name: "Planner"}] = Organization.list_all_employees!()
+    end
   end
 
   defp set_model(employee, model) do

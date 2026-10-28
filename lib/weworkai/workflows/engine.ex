@@ -808,11 +808,43 @@ defmodule Weworkai.Workflows.Engine do
   # Which agent runs a block: the one it names; for a role, the first that can run, or for
   # a coder role the one pinned when the plan was approved (which then must be able to
   # run). A role nobody has yet gets its default agent while a connector is connected
-  # (`Organization.DefaultAgent`). A reviewer role with none that can run is skipped, unless
-  # a human asked for it by Continue while its agents only lack setup. A refusal names the
-  # block.
+  # (`Organization.DefaultAgent`); when it can't be made there, the block is refused, a
+  # reviewer one too. A reviewer role with none that can run is skipped, unless a human
+  # asked for it by Continue while its agents only lack setup. A refusal names the block.
   defp pick(%{employee_id: nil} = node, role, task, arrival) do
-    agents = with [] <- agents_in(role), do: List.wrap(DefaultAgent.provision(role))
+    case agents_or_default(role) do
+      {:ok, agents} ->
+        pick_in(agents, node, role, task, arrival)
+
+      {:error, reason} ->
+        {:error, NoAgent.exception(role: role, block: node.label, default_error: reason)}
+    end
+  end
+
+  defp pick(node, role, _task, _arrival) do
+    employee =
+      Organization.get_employee!(node.employee_id,
+        load: [agent: [:employee, connector_link: :connector]]
+      )
+
+    if runnable?(employee.agent),
+      do: {:ok, employee.agent},
+      else: {:error, not_runnable(node, role, [employee.agent])}
+  end
+
+  defp agents_or_default(role), do: agents_or_default(role, agents_in(role))
+
+  defp agents_or_default(role, []) do
+    case DefaultAgent.provision(role) do
+      {:ok, agent} -> {:ok, [agent]}
+      :none -> {:ok, []}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp agents_or_default(_role, agents), do: {:ok, agents}
+
+  defp pick_in(agents, node, role, task, arrival) do
     pinned = role == :coder && Enum.find(agents, &(&1.employee.id == task.pinned_coder_id))
     runnable = Enum.find(agents, &runnable?/1)
 
@@ -833,17 +865,6 @@ defmodule Weworkai.Workflows.Engine do
     end
   end
 
-  defp pick(node, role, _task, _arrival) do
-    employee =
-      Organization.get_employee!(node.employee_id,
-        load: [agent: [:employee, connector_link: :connector]]
-      )
-
-    if runnable?(employee.agent),
-      do: {:ok, employee.agent},
-      else: {:error, not_runnable(node, role, [employee.agent])}
-  end
-
   defp runnable?(agent), do: is_nil(Agents.missing_setup(agent))
 
   defp agents_in(role) do
@@ -853,9 +874,7 @@ defmodule Weworkai.Workflows.Engine do
     )
   end
 
-  # With a connector connected, the role's default agent could not be made on it.
-  defp not_runnable(node, role, []),
-    do: NoAgent.exception(role: role, block: node.label, connector: Connectors.first_connected())
+  defp not_runnable(node, role, []), do: NoAgent.exception(role: role, block: node.label)
 
   defp not_runnable(node, _role, [agent | _]),
     do:

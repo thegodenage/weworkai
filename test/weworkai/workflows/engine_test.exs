@@ -10,7 +10,6 @@ defmodule Weworkai.Workflows.EngineTest do
 
   alias Weworkai.{Agents, Board, BridgeStub, Connectors, Notifications, Organization, Workflows}
   alias Weworkai.{ErrorText, Scheduling}
-  alias Weworkai.Connectors.ClaudeBridge
   alias Weworkai.Scheduling.{Job, Scheduler}
 
   import Weworkai.WorkflowFixtures
@@ -998,22 +997,47 @@ defmodule Weworkai.Workflows.EngineTest do
       assert ["Ada"] = Enum.map(Organization.list_all_employees!(), & &1.name)
     end
 
-    test "a connector that lists no models makes nobody, and the refusal names it",
-         %{connector: connector} do
+    test "a connector that can't list its models makes nobody, and the refusal says why",
+         %{bridge: bridge, connector: connector} do
       with_status(connector, :connected)
-      Req.Test.stub(ClaudeBridge, fn conn ->
-        conn |> Plug.Conn.put_status(503) |> Req.Test.json(%{"error" => "restarting"})
-      end)
+      BridgeStub.models_down(bridge, true)
       task = Board.create_task!(%{title: "Bare"})
 
       assert {:error, %Ash.Error.Invalid{errors: [error]}} =
                Board.continue_task(task, block_id(task, "Coder"))
 
       assert ErrorText.readable(error) ==
-               "Coder can't run: No coder agent yet, and Claude lists no models to make a " <>
-                 "default one. Check it on the Connectors page."
+               "Coder can't run: No coder agent yet, and none could be made on Claude: " <>
+                 "Claude bridge failed: restarting."
 
       assert Organization.list_all_employees!() == []
+    end
+
+    test "a review whose default agent can't be made stops the task, instead of skipping",
+         %{bridge: bridge, connector: connector} = context do
+      {task, team} = planned_task(context, [])
+      with_status(connector, :connected)
+      Board.approve_plan!(task, team.coder.id)
+      BridgeStub.models_down(bridge, true)
+      BridgeStub.step(bridge)
+
+      assert %{status: :await_human_supervision} = task = Board.get_task!(task.id)
+      refute Engine.ready_to_merge?(task)
+      refute :stage_skipped in notification_kinds()
+      assert [:workflow_stuck | _] = notification_kinds()
+
+      assert ["coder", "planner"] =
+               Enum.map(Organization.list_all_employees!(), & &1.name)
+    end
+
+    test "a default agent doesn't take a teammate's name", %{bridge: bridge, connector: connector} do
+      with_status(connector, :connected)
+      Organization.create_employee!(%{kind: :human, name: "Planner", role: "Product planner"})
+      task = Board.create_task!(%{title: "Greet users", repository: "/repos/app"})
+      Board.move_task!(task, :todo)
+      BridgeStub.step(bridge)
+
+      assert ["Planner", "Planner 2"] = Enum.map(Organization.list_all_employees!(), & &1.name)
     end
 
     test "without a connected connector a role nobody has is refused", %{connector: connector} do

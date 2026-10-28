@@ -37,9 +37,12 @@ agent never gets one. So a fresh install runs the template workflows with only a
 Deleting a default agent doesn't stick: the next block in its role makes it again. To keep
 a role's blocks from running (say, to skip reviews), take its blocks out of the workflow,
 or keep an agent in the role without a model (its reviewer / qa blocks are then skipped).
-When the connector lists no models, no default agent is made and the refusal names the
-connector ("Coder can't run: No coder agent yet, and Claude lists no models to make a
-default one. …").
+When the default agent can't be made (the connector can't list its models, or lists none),
+nobody is made and the block is refused with the reason, a reviewer / qa block too, so the
+task stops with a human rather than skipping its review ("Coder can't run: No coder agent
+yet, and none could be made on Claude: Claude bridge is not running. …"). A same-named
+employee makes it "Planner 2". Asking about a task with no planner at all makes the default
+planner to answer (docs/workflow.md).
 When the block about to run has no agent that can, the action is refused naming the
 block and what is missing ("Coder can't run: No coder agent yet. Add one on the
 Employees page.", "Ada can't run: Ada has no model yet. …"); the card stays put. A

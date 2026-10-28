@@ -109,7 +109,8 @@ review. A task without a worktree (never coded) is refused (`Validations.Reviewa
 - Every status change the workflow makes (and every agent failure) creates a Notification.
 - A review block with no runnable agent in its role (`reviewer` / `qa`: model + connector
   set) is skipped with a `stage_skipped` notification, unless the role has no agent at all
-  and a connector is connected: then its default agent runs, so with a connected connector
+  and a connector is connected: then its default agent runs (and when it can't be made,
+  the task stops with a human instead of skipping), so with a connected connector
   reviews run unless the workflow leaves them out or the role keeps an agent without a
   model. The first runnable one (by id) is used.
 - The review loop counts **fix rounds**: `review_round` goes up each time the coder is sent
@@ -125,7 +126,9 @@ it with the task's full context, without touching the task's own work.
   `question` message and creates a Job with stage **`ask`** (`Engine.ask_job/3`). Refused
   (no message, no job) when the body is blank or no agent can answer.
 - **Who answers:** the first runnable planner, else reviewer (`Engine.answerer/0`) —
-  both read-only profiles, so a question can never change code.
+  both read-only profiles, so a question can never change code. With neither, no planner
+  at all and a connector connected, asking makes the default planner
+  (`Organization.DefaultAgent`), which answers (`#default-answerer` on the Ask tab).
 - **Which context:** the run forks the task's latest conversation, `code_session_id` (in
   the worktree) else `plan_session_id` (in the repository): the bridge's `resume` +
   `fork: true` → `claude --resume <id> --fork-session --session-id <new>`, so the original
