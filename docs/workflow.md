@@ -38,6 +38,19 @@ the coder's bridge per arrival at the gate), open findings per severity, each ag
 report, runs per stage (time, cost, last state, log link), spend against the task's budget
 and the span from the first run to the last.
 
+**Merge helper.** While the task waits for a human with a branch outside planning and
+coding (`Engine.mergeable?/1`: the gate, a stopped merger block, a failed merge), the
+toolbar's `#merge-form` (`#merge-branch`, blank = the branch checked out in the
+repository; `#merge-task` "Merge with agent", disabled until a merger agent can run)
+calls `Board.merge_task(task, branch \\ nil)` (`Engine.merge/2`). The first runnable
+**merger** (role `merger`, stage `merging`, profile `merger`) runs in the repository and
+merges the worktree branch into the target with `--no-ff`, resolving conflicts (it
+aborts and reports `blocked` when one needs a decision). The task keeps its place: the
+result brings it back to the gate, so the human still decides; a merge records
+`merged_into` / `merge_commit` (`#merged-into` in the banner) and notifies `merged`, a
+blocked one `merge_blocked`. A merger block does the same without a human
+(docs/workflows.md).
+
 Questions a human asks about a task (Ask tab) are answered beside this lifecycle and never
 move the task; see "Ask" below.
 
@@ -229,7 +242,8 @@ being canceled even when the task itself doesn't change. Spinners stand still un
 | field | |
 |---|---|
 | `repository` | folder of the git repo the agents work in; blank means `~/Projects` (the bridge's default allowed root), prefilled in the new task form; editable in the form, the drawer and the task header, each with a folder picker listing the bridge's allowed folders (`GET /folders`) |
-| `stage` | `planning` \| `coding` \| `code_review` \| `qa` \| nil (not in an agent stage, e.g. ready to merge) |
+| `stage` | `planning` \| `coding` \| `code_review` \| `qa` \| `merging` \| nil (not in an agent stage, e.g. ready to merge) |
+| `merged_into` / `merge_commit` | the merger's last merge of the branch; cleared when the coder finishes new work |
 | `plan` | embedded `Board.Plan` (`summary`, `steps[id,title,description,changes[path,diff]]`, `questions`) — latest plan |
 | `plan_approved_at` | set by `approve_plan` |
 | `plan_session_id` / `code_session_id` | Claude conversation of the planner / coder, resumed by later runs |
@@ -313,6 +327,7 @@ Whatever an agent breaks stays in its container; only the mounts below reach the
   | planner, reviewer | read-only | read-only | none |
   | coder, custom | read-write | read-write, except `config` and `hooks` (read-only) | none |
   | qa | read-write (it may build) | read-only | own `docker:dind` sidecar |
+  | merger (run folder = the repository, worktrees inside it) | read-write | read-write, except `config` and `hooks` (read-only) | none |
 
   A worktree's `.git` file points into `<repo>/.git/worktrees/<name>`, so the coder's
   `git commit` in the container lands on the host's `weworkai/<task>` branch. `config`
@@ -380,6 +395,13 @@ Coder (`outcome` schema):
 ```json
 {"status": "done" | "blocked", "summary": "markdown",
  "questions": [{"id": "q1", "question": "…", "options": []}]}
+```
+
+Merger (`merge` schema):
+
+```json
+{"status": "merged" | "blocked", "summary": "markdown", "branch": "main",
+ "commit": "merge commit hash, empty when blocked"}
 ```
 
 ## Human loop (task view `/tasks/:id`)
