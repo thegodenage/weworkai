@@ -182,7 +182,13 @@ defmodule WeworkaiWeb.BoardLive do
     {:noreply,
      socket
      |> cancel_upload(:attachments, ref)
-     |> forget_file(entry && entry.client_name)}
+     |> forget_files(if(entry, do: [entry.client_name], else: []))}
+  end
+
+  # The editor pasted more images than the upload has room for and kept only the first ones.
+  def handle_event("paste_skipped", %{"count" => count}, socket) do
+    max = socket.assigns.uploads.attachments.max_entries
+    {:noreply, put_flash(socket, :error, "#{count} not pasted: at most #{max} files at a time.")}
   end
 
   def handle_event("remove_attachment", %{"id" => id}, socket) do
@@ -192,7 +198,7 @@ defmodule WeworkaiWeb.BoardLive do
     {:noreply,
      socket
      |> assign(attachments: Board.list_attachments!(socket.assigns.task.id))
-     |> forget_file(attachment.name)}
+     |> forget_files([attachment.name])}
   end
 
   # The workflow moves tasks too; whatever changed a task, its card follows.
@@ -296,7 +302,9 @@ defmodule WeworkaiWeb.BoardLive do
   defp text?(task, query) do
     case String.downcase(String.trim(query)) do
       "" -> true
-      query -> String.contains?(String.downcase("#{task.title} #{task.description}"), query)
+      query ->
+        text = without_images("#{task.title} #{task.description}")
+        String.contains?(String.downcase(text), query)
     end
   end
 
@@ -381,7 +389,23 @@ defmodule WeworkaiWeb.BoardLive do
   defp close_uploads(%{assigns: %{uploads_consumed?: true}} = socket),
     do: assign(socket, uploads_consumed?: false)
 
-  defp close_uploads(socket), do: cancel_uploads(socket)
+  # A drawer closed mid-upload saved the pasted references already; they go with the files.
+  defp close_uploads(socket) do
+    entries = socket.assigns.uploads.attachments.entries
+    in_flight = for entry <- entries, entry.valid?, do: entry.client_name
+
+    socket =
+      socket
+      |> cancel_uploads()
+      |> forget_files(Enum.map(entries, & &1.client_name))
+
+    if in_flight != [] and socket.assigns[:task] do
+      names = Enum.join(in_flight, ", ")
+      put_flash(socket, :error, "Not attached: #{names}. The drawer closed before it uploaded.")
+    else
+      socket
+    end
+  end
 
   defp cancel_uploads(socket) do
     Enum.reduce(socket.assigns.uploads.attachments.entries, socket, fn entry, socket ->
@@ -440,15 +464,44 @@ defmodule WeworkaiWeb.BoardLive do
 
   defp uploading?(upload), do: Enum.any?(upload.entries, &(not &1.done?))
 
-  # The description editor drops its pasted `![name](name)` reference to a file that is gone.
-  defp forget_file(socket, nil), do: socket
-  defp forget_file(socket, name), do: push_event(socket, "file-removed", %{name: name})
+  # Files that won't be attached take their pasted `![name](name)` references with them: the
+  # editor drops them from its textarea, and the drawer's task from its saved description, as
+  # the editor's debounced save is lost if the drawer closes first.
+  defp forget_files(socket, []), do: socket
 
-  # A card's excerpt skips image references, which are long and say nothing.
+  defp forget_files(socket, names) do
+    socket = Enum.reduce(names, socket, &push_event(&2, "file-removed", %{name: &1}))
+
+    with %Task{id: id} <- socket.assigns[:task],
+         {:ok, task} <- Board.get_task(id),
+         description when description != task.description <-
+           without_references(task.description, names),
+         {:ok, task} <- Board.update_task(task, %{description: description}) do
+      socket
+      |> place(task)
+      |> assign(details_form: to_form(Board.form_to_update_task(task)))
+    else
+      _ -> socket
+    end
+  end
+
+  defp without_references(nil, _names), do: nil
+
+  defp without_references(description, names) do
+    Enum.reduce(names, description, fn name, description ->
+      reference = Regex.escape("![#{name}](#{name})")
+      line = Regex.compile!("^#{reference}\\n?|\\n?#{reference}", "m")
+      String.replace(description, line, "")
+    end)
+  end
+
+  # Image references are long and say nothing, so cards and search skip them.
+  defp without_images(text), do: String.replace(text, ~r/!\[[^\]]*\]\([^)]*\)/, "")
+
   defp excerpt(nil), do: nil
 
   defp excerpt(description) do
-    case description |> String.replace(~r/!\[[^\]]*\]\([^)]*\)/, "") |> String.trim() do
+    case description |> without_images() |> String.trim() do
       "" -> nil
       text -> text
     end

@@ -663,6 +663,7 @@ defmodule WeworkaiWeb.CoreComponents do
       class="fieldset mb-2"
       phx-hook=".MarkdownEditor"
       data-upload={@upload && @upload.name}
+      data-upload-room={@upload && @upload.max_entries - length(@upload.entries)}
     >
       <span :if={@label} class="label mb-1">{@label}</span>
       <div class="rounded-md border border-(--orpheus-border) bg-base-200 focus-within:border-primary">
@@ -733,9 +734,13 @@ defmodule WeworkaiWeb.CoreComponents do
             const upload = this.el.dataset.upload
             const clipboard = event.clipboardData
             if (!upload || !clipboard || clipboard.types.includes("text/plain")) return
-            const images = Array.from(clipboard.files).filter((file) => file.type.startsWith("image/"))
-            if (images.length === 0) return
+            const pasted = Array.from(clipboard.files).filter((file) => file.type.startsWith("image/"))
+            if (pasted.length === 0) return
             event.preventDefault()
+            // More than the upload takes would fail the whole batch; keep the ones that fit.
+            const images = pasted.slice(0, Math.max(0, Number(this.el.dataset.uploadRoom)))
+            if (images.length < pasted.length) this.pushEvent("paste_skipped", {count: pasted.length - images.length})
+            if (images.length === 0) return
             // Every screenshot pastes as "image.png", and a task keeps one file per name.
             // Local time, like the name macOS gives a screenshot.
             const now = new Date()

@@ -42,11 +42,16 @@ defmodule WeworkaiWeb.BoardLiveTest do
     Board.create_task!(%{title: "Write spec", description: "First draft"})
     lean = Weworkai.Workflows.create_workflow!("Lean")
     login = Board.create_task!(%{title: "Fix login", workflow_id: lean.id})
+    Board.create_task!(%{title: "Pasted shot", description: "![shot.png](shot.png)"})
     {:ok, view, _html} = live(conn, ~p"/")
 
     view |> form("#board-filters", filter: %{q: "draft"}) |> render_change()
     assert has_element?(view, "#column-backlog article", "Write spec")
     refute has_element?(view, "#column-backlog article", "Fix login")
+
+    # Search skips the image references the cards hide.
+    view |> form("#board-filters", filter: %{q: "png"}) |> render_change()
+    refute has_element?(view, "#column-backlog article", "Pasted shot")
 
     view |> form("#board-filters", filter: %{q: "", workflow: lean.id}) |> render_change()
     assert has_element?(view, "#column-backlog article", "Fix login")
@@ -435,7 +440,12 @@ defmodule WeworkaiWeb.BoardLiveTest do
   end
 
   test "the drawer attaches a file once uploaded, shows it and removes it", %{conn: conn} do
-    task = Board.create_task!(%{title: "Needs a mockup"})
+    task =
+      Board.create_task!(%{
+        title: "Needs a mockup",
+        description: "Intro\n![mock up.png](mock up.png)"
+      })
+
     {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
 
     view
@@ -452,8 +462,36 @@ defmodule WeworkaiWeb.BoardLiveTest do
 
     assert Board.list_attachments!(task.id) == []
     refute has_element?(view, "#attachment-#{id}")
-    # The description editor drops its pasted reference to the removed file.
+    # The description drops its pasted reference to the removed file, saved at once.
     assert_push_event(view, "file-removed", %{name: "mock up.png"})
+    assert Board.get_task!(task.id).description == "Intro"
+  end
+
+  test "closing the drawer mid-upload drops the file's saved reference and says so",
+       %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Slow paste", description: "![#{name}](#{name})\nOutro"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: String.duplicate("png", 100), type: "image/png"}
+    ])
+    |> render_upload(name, 10)
+
+    render_patch(view, ~p"/")
+
+    assert Board.get_task!(task.id).description == "Outro"
+    assert Board.list_attachments!(task.id) == []
+    assert has_element?(view, "#flash-error", name)
+  end
+
+  test "a paste beyond the upload's room is refused with a message", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    assert has_element?(view, "#task-form-description[data-upload-room='10']")
+
+    render_hook(view, "paste_skipped", %{"count" => 2})
+    assert has_element?(view, "#flash-error", "2 not pasted")
   end
 
   test "the drawer previews an attached file whose name has a space", %{conn: conn} do
