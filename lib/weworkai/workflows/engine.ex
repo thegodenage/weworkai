@@ -853,7 +853,9 @@ defmodule Weworkai.Workflows.Engine do
     )
   end
 
-  defp not_runnable(node, role, []), do: NoAgent.exception(role: role, block: node.label)
+  # With a connector connected, the role's default agent could not be made on it.
+  defp not_runnable(node, role, []),
+    do: NoAgent.exception(role: role, block: node.label, connector: Connectors.first_connected())
 
   defp not_runnable(node, _role, [agent | _]),
     do:

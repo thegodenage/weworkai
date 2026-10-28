@@ -109,7 +109,9 @@ review. A task without a worktree (never coded) is refused (`Validations.Reviewa
 - Every status change the workflow makes (and every agent failure) creates a Notification.
 - A review block with no runnable agent in its role (`reviewer` / `qa`: model + connector
   set) is skipped with a `stage_skipped` notification, unless the role has no agent at all
-  and a connector is connected: then its default agent runs. The first runnable one (by id) is used.
+  and a connector is connected: then its default agent runs, so with a connected connector
+  reviews run unless the workflow leaves them out or the role keeps an agent without a
+  model. The first runnable one (by id) is used.
 - The review loop counts **fix rounds**: `review_round` goes up each time the coder is sent
   back with findings; the limit shown ("fix round n of 3") is the sum of the caps of the
   workflow's findings arrows into coder blocks (`Engine.fix_round_limit/1`).

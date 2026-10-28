@@ -7,7 +7,7 @@ defmodule Weworkai.Organization.DefaultAgent do
   employee, configurable on the Employees page; a role that has any agent, set up or not,
   never gets one.
   """
-  alias Weworkai.{Agents, Connectors, Organization}
+  alias Weworkai.{Agents, Connectors, Organization, Repo}
   alias Weworkai.Agents.Agent.Role
 
   @doc "Whether a role block in `role` would get a default agent now."
@@ -37,17 +37,24 @@ defmodule Weworkai.Organization.DefaultAgent do
   defp create(role, connector) do
     case Connectors.model_options(connector) do
       {:ok, %{models: [%{id: model} | _]}} ->
-        employee =
-          Organization.create_employee!(%{
-            kind: :agent,
-            name: Role.label(role),
-            agent_role: role,
-            connector_id: connector.id
-          })
+        # One write, so the role never ends up with a half-made agent. The model was just
+        # listed by the connector, so :configure's check (another request) is skipped.
+        Repo.transaction(fn ->
+          employee =
+            Organization.create_employee!(%{
+              kind: :agent,
+              name: Role.label(role),
+              agent_role: role,
+              connector_id: connector.id
+            })
 
-        # Should the connector drop the model in between, the agent stays without one and
-        # the block's refusal names what it lacks.
-        _ = Agents.configure_agent(Agents.get_agent!(employee.agent_id), %{model: model})
+          employee.agent_id
+          |> Agents.get_agent!()
+          |> Ash.Changeset.for_update(:assign_role, %{role: role})
+          |> Ash.Changeset.force_change_attribute(:model, model)
+          |> Ash.update!()
+        end)
+
         in_role(role)
 
       _none ->

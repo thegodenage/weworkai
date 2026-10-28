@@ -10,6 +10,7 @@ defmodule Weworkai.Workflows.EngineTest do
 
   alias Weworkai.{Agents, Board, BridgeStub, Connectors, Notifications, Organization, Workflows}
   alias Weworkai.{ErrorText, Scheduling}
+  alias Weworkai.Connectors.ClaudeBridge
   alias Weworkai.Scheduling.{Job, Scheduler}
 
   import Weworkai.WorkflowFixtures
@@ -974,6 +975,45 @@ defmodule Weworkai.Workflows.EngineTest do
 
       assert [%{id: id}] = Organization.list_all_employees!()
       assert id == ada.id
+    end
+
+    test "a role whose agent lacks setup is refused, not given a default one",
+         %{connector: connector} do
+      connector = with_status(connector, :connected)
+
+      Organization.create_employee!(%{
+        kind: :agent,
+        name: "Ada",
+        agent_role: :planner,
+        connector_id: connector.id
+      })
+
+      task = Board.create_task!(%{title: "Greet users", repository: "/repos/app"})
+
+      assert {:error, %Ash.Error.Invalid{errors: [error]}} = Board.move_task(task, :todo)
+
+      assert ErrorText.readable(error) ==
+               "Planner can't run: Ada has no model yet. Configure it on the Employees page."
+
+      assert ["Ada"] = Enum.map(Organization.list_all_employees!(), & &1.name)
+    end
+
+    test "a connector that lists no models makes nobody, and the refusal names it",
+         %{connector: connector} do
+      with_status(connector, :connected)
+      Req.Test.stub(ClaudeBridge, fn conn ->
+        conn |> Plug.Conn.put_status(503) |> Req.Test.json(%{"error" => "restarting"})
+      end)
+      task = Board.create_task!(%{title: "Bare"})
+
+      assert {:error, %Ash.Error.Invalid{errors: [error]}} =
+               Board.continue_task(task, block_id(task, "Coder"))
+
+      assert ErrorText.readable(error) ==
+               "Coder can't run: No coder agent yet, and Claude lists no models to make a " <>
+                 "default one. Check it on the Connectors page."
+
+      assert Organization.list_all_employees!() == []
     end
 
     test "without a connected connector a role nobody has is refused", %{connector: connector} do

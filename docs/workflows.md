@@ -34,6 +34,12 @@ the role ("Planner", "Docker reviewer", …) on the first connected connector by
 the first model it offers and the role's default prompt. It stays an ordinary employee,
 configurable on the Employees page, and the role's later blocks run it; a role with any
 agent never gets one. So a fresh install runs the template workflows with only a connector.
+Deleting a default agent doesn't stick: the next block in its role makes it again. To keep
+a role's blocks from running (say, to skip reviews), take its blocks out of the workflow,
+or keep an agent in the role without a model (its reviewer / qa blocks are then skipped).
+When the connector lists no models, no default agent is made and the refusal names the
+connector ("Coder can't run: No coder agent yet, and Claude lists no models to make a
+default one. …").
 When the block about to run has no agent that can, the action is refused naming the
 block and what is missing ("Coder can't run: No coder agent yet. Add one on the
 Employees page.", "Ada can't run: Ada has no model yet. …"); the card stays put. A
