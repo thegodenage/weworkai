@@ -42,6 +42,9 @@ defmodule WeworkaiWeb.Router do
       live "/workflows/from-template", WorkflowsLive, :template
       live "/workflows/:id", WorkflowLive, :show
       live "/workflows/:id/edit", WorkflowsLive, :edit
+      live "/recurring", RecurringLive, :index
+      live "/recurring/new", RecurringLive, :new
+      live "/recurring/:id/edit", RecurringLive, :edit
     end
   end
 
