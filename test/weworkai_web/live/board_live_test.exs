@@ -424,12 +424,14 @@ defmodule WeworkaiWeb.BoardLiveTest do
 
     view
     |> form("#task-drawer-description-form",
-      form: %{description: "Broken:\n\n![#{name}](#{name})"}
+      form: %{description: "Broken:\n\n![#{name}](#{name})\n\nAs `![#{name}](#{name})`"}
     )
     |> render_change()
 
     assert [%{id: id}] = Board.list_attachments!(task.id)
     assert has_element?(view, "#task-drawer-description-preview img[src='/attachments/#{id}']")
+    # Code that mentions the file keeps its name.
+    assert has_element?(view, "#task-drawer-description-preview code", "](#{name})")
   end
 
   test "the drawer attaches a file once uploaded, shows it and removes it", %{conn: conn} do

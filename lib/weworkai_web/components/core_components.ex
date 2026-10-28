@@ -599,17 +599,23 @@ defmodule WeworkaiWeb.CoreComponents do
     ~H"""
     <div class={["markdown", @class]}>
       {Phoenix.HTML.raw(
-        MDEx.to_html!(link_files(@content || "", @files),
-          sanitize: MDEx.Document.default_sanitize_options()
-        )
+        @content
+        |> Kernel.||("")
+        |> MDEx.to_html!(sanitize: MDEx.Document.default_sanitize_options())
+        |> link_files(@files)
       )}
     </div>
     """
   end
 
-  defp link_files(content, files) do
-    Enum.reduce(files, content, fn {name, url}, content ->
-      String.replace(content, "](#{name})", "](#{url})")
+  # Rewrites the rendered image and link targets, so code that mentions a file is left alone.
+  defp link_files(html, files) do
+    Enum.reduce(files, html, fn {name, url}, html ->
+      target = Phoenix.HTML.html_escape(name) |> Phoenix.HTML.safe_to_string()
+
+      html
+      |> String.replace(~s(src="#{target}"), ~s(src="#{url}"))
+      |> String.replace(~s(href="#{target}"), ~s(href="#{url}"))
     end)
   end
 
@@ -705,11 +711,9 @@ defmodule WeworkaiWeb.CoreComponents do
             if (!button) return
             const {selectionStart: start, selectionEnd: end, value} = textarea
             const {before, after} = button.dataset
-            textarea.value = value.slice(0, start) + before + value.slice(start, end) + after + value.slice(end)
-            textarea.focus()
-            textarea.setSelectionRange(start + before.length, end + before.length)
-            // Programmatic edits don't fire input; LiveView needs it to see the change.
-            textarea.dispatchEvent(new Event("input", {bubbles: true}))
+            const selected = value.slice(start, end)
+            // Keep the wrapped text selected.
+            this.replaceSelection(textarea, before + selected + after, before.length, before.length + selected.length)
           })
 
           textarea.addEventListener("paste", (event) => {
@@ -720,7 +724,12 @@ defmodule WeworkaiWeb.CoreComponents do
             if (images.length === 0) return
             event.preventDefault()
             // Every screenshot pastes as "image.png", and a task keeps one file per name.
-            const stamp = new Date().toISOString().slice(0, 23).replace("T", "-").replace(/:/g, "").replace(".", "-")
+            // Local time, like the name macOS gives a screenshot.
+            const now = new Date()
+            const pad = (n, width = 2) => String(n).padStart(width, "0")
+            const stamp =
+              `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-` +
+              `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${pad(now.getMilliseconds(), 3)}`
             const named = images.map((file, i) => {
               const ext = file.name.match(/\.[A-Za-z0-9]+$/)?.[0] ?? ""
               const index = images.length > 1 ? `-${i + 1}` : ""
@@ -731,10 +740,12 @@ defmodule WeworkaiWeb.CoreComponents do
           })
         },
 
-        replaceSelection(textarea, text) {
+        // Replaces the selection with text, then selects from..to within it (default: cursor after it).
+        replaceSelection(textarea, text, from = text.length, to = from) {
           const {selectionStart: start, selectionEnd: end, value} = textarea
           textarea.value = value.slice(0, start) + text + value.slice(end)
-          textarea.setSelectionRange(start + text.length, start + text.length)
+          textarea.focus()
+          textarea.setSelectionRange(start + from, start + to)
           // Programmatic edits don't fire input; LiveView needs it to see the change.
           textarea.dispatchEvent(new Event("input", {bubbles: true}))
         },
