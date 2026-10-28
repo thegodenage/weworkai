@@ -452,6 +452,61 @@ defmodule WeworkaiWeb.BoardLiveTest do
 
     assert Board.list_attachments!(task.id) == []
     refute has_element?(view, "#attachment-#{id}")
+    # The description editor drops its pasted reference to the removed file.
+    assert_push_event(view, "file-removed", %{name: "mock up.png"})
+  end
+
+  test "the drawer previews an attached file whose name has a space", %{conn: conn} do
+    task = Board.create_task!(%{title: "Spaced"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: "my shot.png", content: "png", type: "image/png"}
+    ])
+    |> render_upload("my shot.png")
+
+    view
+    |> form("#task-drawer-description-form", form: %{description: "![shot](<my shot.png>)"})
+    |> render_change()
+
+    assert [%{id: id}] = Board.list_attachments!(task.id)
+    assert has_element?(view, "#task-drawer-description-preview img[src='/attachments/#{id}']")
+  end
+
+  test "cancelling a pending upload drops its pasted reference", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    name = "screenshot-2026-10-28-143005-123.png"
+
+    view
+    |> file_input("#task-form", :attachments, [%{name: name, content: "png", type: "image/png"}])
+    |> render_upload(name)
+
+    view |> element("#task-form [id^='cancel-upload-']") |> render_click()
+
+    assert_push_event(view, "file-removed", %{name: ^name})
+  end
+
+  test "an unattached reference previews as alt text, not a relative image", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    name = "screenshot-2026-10-28-143005-123.png"
+
+    view
+    |> form("#task-form", form: %{description: "![#{name}](#{name})"})
+    |> render_change()
+
+    assert has_element?(view, "#task-form-description-preview img[alt='#{name}']")
+    refute has_element?(view, "#task-form-description-preview img[src]")
+  end
+
+  test "a card's excerpt leaves out image references", %{conn: conn} do
+    task =
+      Board.create_task!(%{title: "Shot", description: "![s.png](s.png)\nSee the screenshot"})
+
+    {:ok, view, _html} = live(conn, ~p"/")
+
+    assert has_element?(view, "[data-task-id='#{task.id}'] p", "See the screenshot")
+    refute has_element?(view, "[data-task-id='#{task.id}'] p", "![s.png]")
   end
 
   describe "agent activity" do

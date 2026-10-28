@@ -609,15 +609,25 @@ defmodule WeworkaiWeb.CoreComponents do
   end
 
   # Rewrites the rendered image and link targets, so code that mentions a file is left alone.
+  # MDEx percent-encodes targets, so `my shot.png` arrives as `my%20shot.png`.
   defp link_files(html, files) do
-    Enum.reduce(files, html, fn {name, url}, html ->
-      target = Phoenix.HTML.html_escape(name) |> Phoenix.HTML.safe_to_string()
+    files
+    |> Enum.reduce(html, fn {name, url}, html ->
+      Enum.reduce(Enum.uniq([name, URI.encode(name)]), html, fn target, html ->
+        target = target |> Phoenix.HTML.html_escape() |> Phoenix.HTML.safe_to_string()
 
-      html
-      |> String.replace(~s(src="#{target}"), ~s(src="#{url}"))
-      |> String.replace(~s(href="#{target}"), ~s(href="#{url}"))
+        html
+        |> String.replace(~s(src="#{target}"), ~s(src="#{url}"))
+        |> String.replace(~s(href="#{target}"), ~s(href="#{url}"))
+      end)
     end)
+    |> drop_relative_images()
   end
+
+  # An image left with a bare file name (not attached yet) would load e.g. /tasks/<name> and
+  # hit a page route; without a src the browser shows its alt text instead.
+  defp drop_relative_images(html),
+    do: String.replace(html, ~r{(<img\b[^>]*?) src="(?![a-zA-Z][a-zA-Z0-9+.-]*:|/)[^"]*"}, "\\1")
 
   @markdown_tools [
     {"hero-h2-micro", "Heading", "## ", ""},
@@ -702,6 +712,9 @@ defmodule WeworkaiWeb.CoreComponents do
       </div>
     </div>
     <script :type={Phoenix.LiveView.ColocatedHook} name=".MarkdownEditor">
+      const reference = ({name}) => `![${name}](${name})`
+      const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
       export default {
         mounted() {
           const textarea = this.el.querySelector("textarea")
@@ -736,18 +749,34 @@ defmodule WeworkaiWeb.CoreComponents do
               return new File([file], `screenshot-${stamp}${index}${ext}`, {type: file.type})
             })
             this.upload(upload, named)
-            this.replaceSelection(textarea, named.map(({name}) => `![${name}](${name})`).join("\n"))
+            // One line per image, apart from the text around it.
+            const {selectionStart: start, selectionEnd: end, value} = textarea
+            const before = start > 0 && value[start - 1] !== "\n" ? "\n" : ""
+            const after = end < value.length && value[end] !== "\n" ? "\n" : ""
+            this.replaceSelection(textarea, before + named.map(reference).join("\n") + after)
+          })
+
+          // A cancelled or removed file takes its pasted reference with it.
+          this.handleEvent("file-removed", ({name}) => {
+            const ref = escapeRegExp(reference({name}))
+            const line = new RegExp(`^${ref}\n?|\n?${ref}`, "gm")
+            if (!line.test(textarea.value)) return
+            textarea.value = textarea.value.replace(line, "")
+            textarea.dispatchEvent(new Event("input", {bubbles: true}))
           })
         },
 
         // Replaces the selection with text, then selects from..to within it (default: cursor after it).
         replaceSelection(textarea, text, from = text.length, to = from) {
           const {selectionStart: start, selectionEnd: end, value} = textarea
-          textarea.value = value.slice(0, start) + text + value.slice(end)
           textarea.focus()
+          // insertText keeps the undo history (so ⌘Z works) and fires input itself.
+          if (!document.execCommand("insertText", false, text)) {
+            textarea.value = value.slice(0, start) + text + value.slice(end)
+            // Programmatic edits don't fire input; LiveView needs it to see the change.
+            textarea.dispatchEvent(new Event("input", {bubbles: true}))
+          }
           textarea.setSelectionRange(start + from, start + to)
-          // Programmatic edits don't fire input; LiveView needs it to see the change.
-          textarea.dispatchEvent(new Event("input", {bubbles: true}))
         },
       }
     </script>

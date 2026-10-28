@@ -177,12 +177,22 @@ defmodule WeworkaiWeb.BoardLive do
   def handle_event("validate_attachments", _params, socket), do: {:noreply, socket}
 
   def handle_event("cancel_upload", %{"ref" => ref}, socket) do
-    {:noreply, cancel_upload(socket, :attachments, ref)}
+    entry = Enum.find(socket.assigns.uploads.attachments.entries, &(&1.ref == ref))
+
+    {:noreply,
+     socket
+     |> cancel_upload(:attachments, ref)
+     |> forget_file(entry && entry.client_name)}
   end
 
   def handle_event("remove_attachment", %{"id" => id}, socket) do
-    socket.assigns.attachments |> Enum.find(&(&1.id == id)) |> Board.remove_attachment!()
-    {:noreply, assign(socket, attachments: Board.list_attachments!(socket.assigns.task.id))}
+    attachment = Enum.find(socket.assigns.attachments, &(&1.id == id))
+    Board.remove_attachment!(attachment)
+
+    {:noreply,
+     socket
+     |> assign(attachments: Board.list_attachments!(socket.assigns.task.id))
+     |> forget_file(attachment.name)}
   end
 
   # The workflow moves tasks too; whatever changed a task, its card follows.
@@ -430,6 +440,20 @@ defmodule WeworkaiWeb.BoardLive do
 
   defp uploading?(upload), do: Enum.any?(upload.entries, &(not &1.done?))
 
+  # The description editor drops its pasted `![name](name)` reference to a file that is gone.
+  defp forget_file(socket, nil), do: socket
+  defp forget_file(socket, name), do: push_event(socket, "file-removed", %{name: name})
+
+  # A card's excerpt skips image references, which are long and say nothing.
+  defp excerpt(nil), do: nil
+
+  defp excerpt(description) do
+    case description |> String.replace(~r/!\[[^\]]*\]\([^)]*\)/, "") |> String.trim() do
+      "" -> nil
+      text -> text
+    end
+  end
+
   # Lets the description's preview show the attachments it references by name.
   defp attachment_urls(attachments),
     do: Map.new(attachments, &{&1.name, ~p"/attachments/#{&1.id}"})
@@ -625,10 +649,10 @@ defmodule WeworkaiWeb.BoardLive do
                 </div>
                 <p class="text-[13px] leading-snug font-medium break-words">{task.title}</p>
                 <p
-                  :if={task.description}
+                  :if={excerpt(task.description)}
                   class="mt-1 line-clamp-2 break-words text-(--orpheus-text-muted)"
                 >
-                  {task.description}
+                  {excerpt(task.description)}
                 </p>
                 <div
                   :if={task.assignee || task.stage || task.current_node || task.child_count > 0}
