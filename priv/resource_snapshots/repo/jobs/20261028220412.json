@@ -14,31 +14,7 @@
     },
     {
       "allow_nil?": false,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "title",
-      "type": "text"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "description",
-      "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "\"backlog\"",
+      "default": "\"before_start\"",
       "generated?": false,
       "precision": null,
       "primary_key?": false,
@@ -50,14 +26,14 @@
     },
     {
       "allow_nil?": false,
-      "default": "\"~/Projects\"",
+      "default": "nil",
       "generated?": false,
       "precision": null,
       "primary_key?": false,
       "references": null,
       "scale": null,
       "size": null,
-      "source": "repository",
+      "source": "folder",
       "type": "text"
     },
     {
@@ -73,6 +49,18 @@
       "type": "text"
     },
     {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "prompt",
+      "type": "text"
+    },
+    {
       "allow_nil?": true,
       "default": "nil",
       "generated?": false,
@@ -81,7 +69,7 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "plan",
+      "source": "json_schema",
       "type": "map"
     },
     {
@@ -93,7 +81,79 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "plan_approved_at",
+      "source": "resume",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "false",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "fork",
+      "type": "boolean"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "node_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "merge_branch",
+      "type": "text"
+    },
+    {
+      "allow_nil?": false,
+      "default": "15",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "stall_timeout_minutes",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "120",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "turn_timeout_minutes",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "started_at",
       "type": "utc_datetime_usec"
     },
     {
@@ -105,218 +165,8 @@
       "references": null,
       "scale": null,
       "size": null,
-      "source": "plan_session_id",
-      "type": "text"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "code_session_id",
-      "type": "text"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "plan_session_connector_id",
-      "type": "uuid"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "code_session_connector_id",
-      "type": "uuid"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "worktree_path",
-      "type": "text"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "worktree_branch",
-      "type": "text"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "merged_into",
-      "type": "text"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "merge_commit",
-      "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "0",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "review_round",
-      "type": "bigint"
-    },
-    {
-      "allow_nil?": false,
-      "default": "[]",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "open_questions",
-      "type": [
-        "array",
-        "map"
-      ]
-    },
-    {
-      "allow_nil?": false,
-      "default": "[]",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "findings",
-      "type": [
-        "array",
-        "map"
-      ]
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "outcome_summary",
-      "type": "text"
-    },
-    {
-      "allow_nil?": false,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "workflow_version",
-      "type": "bigint"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "current_node_id",
-      "type": "uuid"
-    },
-    {
-      "allow_nil?": false,
-      "default": "%{}",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "edge_counts",
-      "type": "map"
-    },
-    {
-      "allow_nil?": false,
-      "default": "%{}",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "node_counts",
-      "type": "map"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "pinned_coder_id",
-      "type": "uuid"
-    },
-    {
-      "allow_nil?": true,
-      "default": "nil",
-      "generated?": false,
-      "precision": null,
-      "primary_key?": false,
-      "references": null,
-      "scale": null,
-      "size": null,
-      "source": "budget_usd",
-      "type": "decimal"
+      "source": "finished_at",
+      "type": "utc_datetime_usec"
     },
     {
       "allow_nil?": false,
@@ -343,7 +193,7 @@
       "type": "utc_datetime_usec"
     },
     {
-      "allow_nil?": true,
+      "allow_nil?": false,
       "default": "nil",
       "generated?": false,
       "precision": null,
@@ -363,16 +213,16 @@
           "global": null,
           "strategy": null
         },
-        "name": "tasks_assignee_id_fkey",
-        "on_delete": "nilify",
+        "name": "jobs_task_id_fkey",
+        "on_delete": "delete",
         "on_update": null,
         "primary_key?": true,
         "schema": "public",
-        "table": "employees"
+        "table": "tasks"
       },
       "scale": null,
       "size": null,
-      "source": "assignee_id",
+      "source": "task_id",
       "type": "uuid"
     },
     {
@@ -396,16 +246,16 @@
           "global": null,
           "strategy": null
         },
-        "name": "tasks_workflow_id_fkey",
-        "on_delete": null,
+        "name": "jobs_agent_id_fkey",
+        "on_delete": "delete",
         "on_update": null,
         "primary_key?": true,
         "schema": "public",
-        "table": "workflows"
+        "table": "agents"
       },
       "scale": null,
       "size": null,
-      "source": "workflow_id",
+      "source": "agent_id",
       "type": "uuid"
     },
     {
@@ -429,50 +279,26 @@
           "global": null,
           "strategy": null
         },
-        "name": "tasks_parent_id_fkey",
+        "name": "jobs_previous_job_id_fkey",
         "on_delete": "nilify",
         "on_update": null,
         "primary_key?": true,
         "schema": "public",
-        "table": "tasks"
+        "table": "jobs"
       },
       "scale": null,
       "size": null,
-      "source": "parent_id",
+      "source": "previous_job_id",
       "type": "uuid"
     }
   ],
   "base_filter": null,
   "check_constraints": [],
   "create_table_options": null,
-  "custom_indexes": [
-    {
-      "all_tenants?": false,
-      "concurrently": false,
-      "error_fields": [
-        "parent_id"
-      ],
-      "fields": [
-        {
-          "type": "atom",
-          "value": "parent_id"
-        }
-      ],
-      "include": null,
-      "include_base_filter?": true,
-      "message": null,
-      "name": null,
-      "nulls_distinct": true,
-      "prefix": null,
-      "table": null,
-      "unique": false,
-      "using": null,
-      "where": null
-    }
-  ],
+  "custom_indexes": [],
   "custom_statements": [],
   "has_create_action": true,
-  "hash": "A66767B1EE21FA016F2B4638B0747E031D89B5B2E0068AA99CB7A6E93B1AD013",
+  "hash": "7FA5822E8FC255375EACBF71EC5B79AF5EAE9D8746DDED7256A7A0E03B071046",
   "identities": [],
   "multitenancy": {
     "attribute": null,
@@ -481,6 +307,6 @@
   },
   "repo": "Elixir.Weworkai.Repo",
   "schema": null,
-  "table": "tasks",
+  "table": "jobs",
   "temporal": null
 }

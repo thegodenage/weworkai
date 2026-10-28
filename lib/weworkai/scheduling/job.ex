@@ -48,11 +48,18 @@ defmodule Weworkai.Scheduling.Job do
              )
     end
 
-    # The task's newest workflow job with its attempts; nil when it never had one.
+    # The task's newest workflow job with its attempts; nil when it never had one. A merge
+    # a human asked for beside the graph is left out: it brings the task back itself, even
+    # when it fails, so it never leaves the task to restart.
     read :latest do
       argument :task_id, :uuid, allow_nil?: false
       get? true
-      filter expr(task_id == ^arg(:task_id) and (is_nil(stage) or stage != :ask))
+
+      filter expr(
+               task_id == ^arg(:task_id) and (is_nil(stage) or stage != :ask) and
+                 (is_nil(stage) or stage != :merging or not is_nil(node_id))
+             )
+
       prepare build(sort: [inserted_at: :desc], limit: 1, load: [:scheduled_jobs])
     end
 
@@ -62,6 +69,12 @@ defmodule Weworkai.Scheduling.Job do
       argument :task_id, :uuid, allow_nil?: false
       filter expr(task_id == ^arg(:task_id))
       prepare build(sort: [inserted_at: :asc], load: [:scheduled_jobs, agent: :employee])
+    end
+
+    # Merger runs working now, each in its folder (the repository): a second merge there
+    # waits for them (`Weworkai.Scheduling.Scheduler`).
+    read :running_merges do
+      filter expr(stage == :merging and status == :in_progress)
     end
 
     read :active_for_agent do
@@ -86,7 +99,8 @@ defmodule Weworkai.Scheduling.Job do
         :resume,
         :fork,
         :stall_timeout_minutes,
-        :turn_timeout_minutes
+        :turn_timeout_minutes,
+        :merge_branch
       ]
 
       validate present(:resume), where: [attribute_equals(:fork, true)]
@@ -198,7 +212,12 @@ defmodule Weworkai.Scheduling.Job do
 
     # The workflow block the job runs for; no foreign key, blocks are replaced when their
     # graph is saved. nil for a question, and for jobs from before it was kept.
+    # nil for a merge a human asked for beside the graph (`Engine.merge/2`) too.
     attribute :node_id, :uuid, public?: true
+
+    # A merger job's target branch, which its reported merge must name; nil: the branch
+    # checked out in the repository.
+    attribute :merge_branch, :string, public?: true, constraints: [max_length: 255]
 
     # A running agent that writes nothing for this long, or runs this long in all, is stopped
     # and retried (`Weworkai.Scheduling.Timeout`).

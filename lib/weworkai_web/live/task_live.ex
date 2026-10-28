@@ -95,7 +95,7 @@ defmodule WeworkaiWeb.TaskLive do
       continue_targets: Board.continue_targets(task),
       ready_to_merge?: Engine.ready_to_merge?(task),
       mergeable?: Engine.mergeable?(task) and not Activity.workflow?(task.activity),
-      merge_placeholder: merge_placeholder(Engine.merger_block(graph, task)),
+      merge_default: merge_default(Engine.merger_block(graph, task)),
       pending_asks: length(Scheduling.active_asks!(task.id)),
       usage: Usage.total(Agents.task_usage!(task.id)),
       answerer: Engine.answerer(),
@@ -322,6 +322,8 @@ defmodule WeworkaiWeb.TaskLive do
 
   def handle_event("merge", %{"branch" => branch}, socket) do
     branch = if String.trim(branch) == "", do: nil, else: String.trim(branch)
+    # A blank merge on a merger block goes into that block's own target.
+    target = branch || socket.assigns.merge_default
 
     case Board.merge_task(socket.assigns.task, branch) do
       {:ok, task} ->
@@ -330,7 +332,7 @@ defmodule WeworkaiWeb.TaskLive do
          |> load(task)
          |> put_flash(
            :info,
-           "The merger merges #{task.worktree_branch} into #{branch || "the checked-out branch"}."
+           "The merger merges #{task.worktree_branch} into #{target || "the checked-out branch"}."
          )}
 
       {:error, error} ->
@@ -467,9 +469,9 @@ defmodule WeworkaiWeb.TaskLive do
   defp merge_hint(_merger),
     do: "An agent merges the branch and resolves any conflicts; the task then waits for you again"
 
-  # A merger block's own target is what a blank merge there uses.
-  defp merge_placeholder(%{merge_branch: branch}) when is_binary(branch), do: branch
-  defp merge_placeholder(_block), do: "checked-out branch"
+  # Where a blank merge goes: a merger block's own target, else the checked-out branch (nil).
+  defp merge_default(%{merge_branch: branch}), do: branch
+  defp merge_default(_block), do: nil
 
   defp short_commit(commit) when commit in [nil, ""], do: nil
   defp short_commit(commit), do: String.slice(commit, 0, 7)
@@ -775,9 +777,9 @@ defmodule WeworkaiWeb.TaskLive do
               name="branch"
               value={@merge_branch}
               maxlength="255"
-              placeholder={@merge_placeholder}
+              placeholder={@merge_default || "checked-out branch"}
               aria-label="Branch to merge into"
-              title={"Blank merges into #{@merge_placeholder}"}
+              title={"Blank merges into #{@merge_default || "the branch checked out in the repository"}"}
               class="input input-sm w-40 border-r-0 font-mono text-xs"
             />
             <button

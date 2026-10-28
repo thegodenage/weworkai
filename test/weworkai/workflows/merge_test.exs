@@ -6,7 +6,8 @@ defmodule Weworkai.Workflows.MergeTest do
 
   alias Weworkai.{Agents, Board, BridgeStub, Connectors, ErrorText, Notifications}
   alias Weworkai.{Organization, Scheduling, Workflows}
-  alias Weworkai.Workflows.Engine
+  alias Weworkai.Scheduling.Scheduler
+  alias Weworkai.Workflows.{Engine, Graph}
 
   setup do
     connector = Connectors.create_connector!(%{name: "Claude", provider: :claude_code})
@@ -46,9 +47,12 @@ defmodule Weworkai.Workflows.MergeTest do
   defp kinds, do: Enum.map(Notifications.recent_notifications!(), & &1.kind)
 
   # Planned, coded and reviewed on the default workflow: waiting at its "Approve" gate.
-  defp ready_task(%{bridge: bridge, connector: connector}) do
+  defp ready_task(%{connector: connector} = context) do
     team = Map.new([:planner, :coder, :reviewer, :qa], &{&1, agent(connector, &1)})
+    ready_task(context, team.coder)
+  end
 
+  defp ready_task(%{bridge: bridge}, coder) do
     task =
       Board.create_task!(%{
         title: "Greet users",
@@ -58,7 +62,7 @@ defmodule Weworkai.Workflows.MergeTest do
 
     Board.move_task!(task, :todo)
     BridgeStub.step(bridge)
-    Board.approve_plan!(Board.get_task!(task.id), team.coder.id)
+    Board.approve_plan!(Board.get_task!(task.id), coder.id)
     BridgeStub.step(bridge)
     BridgeStub.step(bridge)
     BridgeStub.step(bridge)
@@ -100,7 +104,11 @@ defmodule Weworkai.Workflows.MergeTest do
                List.last(Board.list_messages!(task.id))
 
       # On no block, so the audit timeline shows a merge, not a run of the gate.
-      assert %{stage: :merging, node_id: nil} = Scheduling.latest_job!(task.id)
+      assert %{stage: :merging, node_id: nil, merge_branch: "main"} =
+               List.last(Scheduling.task_jobs!(task.id))
+
+      # Nor does it count as the workflow's latest job (`Engine.restartable?/1`).
+      assert %{stage: :qa} = Scheduling.latest_job!(task.id)
     end
 
     test "a blocked merge leaves the gate as it was",
@@ -119,6 +127,70 @@ defmodule Weworkai.Workflows.MergeTest do
       assert %{status: :await_human_supervision, stage: nil, merged_into: nil} = task
       assert task.current_node.label == "Approve"
       assert :merge_blocked in kinds()
+    end
+
+    test "a failed run brings the task back to its gate as it was",
+         %{bridge: bridge, connector: connector} = context do
+      task = ready_task(context)
+      agent(connector, :merger)
+      BridgeStub.queue(bridge, "merger", :fail)
+
+      Board.merge_task!(task, "main")
+      BridgeStub.step(bridge)
+
+      merged = Board.get_task!(task.id, load: :current_node)
+      assert %{status: :await_human_supervision, stage: nil, merged_into: nil} = merged
+      assert merged.assignee_id == task.assignee_id
+      assert merged.current_node.label == "Approve"
+      assert Engine.ready_to_merge?(merged)
+      assert Engine.mergeable?(merged)
+      assert :agent_failed in kinds()
+    end
+
+    test "a reported merge into another branch, or none, is no merge",
+         %{bridge: bridge, connector: connector} = context do
+      task = ready_task(context)
+      agent(connector, :merger)
+      BridgeStub.queue(bridge, "merger", BridgeStub.merge("merged", "main"))
+      BridgeStub.queue(bridge, "merger", BridgeStub.merge("merged", ""))
+
+      Board.merge_task!(task, "release")
+      BridgeStub.step(bridge)
+      task = Board.get_task!(task.id)
+      assert %{stage: nil, merged_into: nil, merge_commit: nil} = task
+      assert :merge_blocked in kinds()
+      refute :merged in kinds()
+
+      assert List.last(Board.list_messages!(task.id)).body =~
+               "reported a merge into `main`, but was asked for `release`"
+
+      Board.merge_task!(task)
+      BridgeStub.step(bridge)
+      assert %{merged_into: nil} = Board.get_task!(task.id)
+      assert List.last(Board.list_messages!(task.id)).body =~ "reported a merge into no branch"
+    end
+
+    test "a second merge in the same repository waits for the first",
+         %{bridge: bridge, connector: connector} = context do
+      team = Map.new([:planner, :coder, :reviewer, :qa], &{&1, agent(connector, &1)})
+      first = ready_task(context, team.coder)
+      second = ready_task(context, team.coder)
+      agent(connector, :merger)
+
+      Board.merge_task!(first, "main")
+      Board.merge_task!(second, "main")
+
+      Scheduler.dispatch_due()
+      assert [%{"profile" => "merger"}] = started_runs()
+
+      # The first finishes; the second still waited while it ran.
+      BridgeStub.step(bridge)
+      assert [] = started_runs()
+
+      BridgeStub.step(bridge)
+      assert [%{"profile" => "merger"}] = started_runs()
+      assert %{merged_into: "main"} = Board.get_task!(first.id)
+      assert %{merged_into: "main"} = Board.get_task!(second.id)
     end
 
     test "is refused without a merger, for a name that is no branch, and without code",
@@ -145,13 +217,18 @@ defmodule Weworkai.Workflows.MergeTest do
     defp arrow(id, from, to, condition),
       do: %{id: id, from: from, to: to, condition: condition}
 
-    defp auto_merge!(%{connector: connector}) do
-      agent(connector, :coder)
+    defp auto_merge!(%{connector: connector}, opts \\ []) do
+      coder = agent(connector, :coder)
       agent(connector, :merger)
       workflow = Workflows.create_workflow!("Auto-merge")
 
+      code =
+        if opts[:coder] == :named,
+          do: [employee_id: coder.id, label: "Code", x: 0],
+          else: [agent_role: :coder, label: "Code", x: 0]
+
       nodes = [
-        block("c", :agent, agent_role: :coder, label: "Code", x: 0),
+        block("c", :agent, code),
         block("m", :agent, agent_role: :merger, label: "Merge", merge_branch: "release", x: 200),
         block("d", :column, column_status: :done, label: "Done", x: 400)
       ]
@@ -231,8 +308,25 @@ defmodule Weworkai.Workflows.MergeTest do
       assert prompt =~ "into `main`"
 
       task = Board.get_task!(task.id, load: :current_node)
-      assert %{status: :await_human_supervision, stage: nil, merged_into: "main"} = task
+      assert %{status: :await_human_supervision, stage: :merging, merged_into: "main"} = task
       assert task.current_node.label == "Merge"
+      # The block's own merge is still to do: no "ready to merge" gate here.
+      refute Engine.ready_to_merge?(task)
+    end
+
+    test "running the block again is refused on a version with problems",
+         %{bridge: bridge} = context do
+      BridgeStub.queue(bridge, "merger", BridgeStub.merge("blocked", "release"))
+      task = auto_merge!(context, coder: :named)
+      BridgeStub.step(bridge)
+      BridgeStub.step(bridge)
+
+      # Its coder became a reviewer: the coder block's "done" arrow is a problem now.
+      coder = Enum.find(Agents.list_agents!(load: :employee), &(&1.role == :coder))
+      coder |> Ash.Changeset.for_update(:assign_role, %{role: :reviewer}) |> Ash.update!()
+
+      assert {:error, error} = Board.merge_task(Board.get_task!(task.id))
+      assert ErrorText.readable(error) =~ "Auto-merge"
     end
 
     test "is not offered on another agent block, whose step isn't done", context do
@@ -266,6 +360,14 @@ defmodule Weworkai.Workflows.MergeTest do
 
       assert %{id: "c", message: "Only merger blocks merge into a branch"} in problems
       assert %{id: "m", message: "“-x..y” is not a branch name"} in problems
+    end
+
+    test "branch names follow git's rules" do
+      for name <- ~w(main release/1.2 feature/x-y v1.0_rc),
+          do: assert(Graph.branch_name?(name), name)
+
+      for name <- ~w(HEAD main.lock feature/x.lock/y feature/x.lock a..b -x x/ x. .x a/.b a//b),
+          do: refute(Graph.branch_name?(name), name)
     end
   end
 end

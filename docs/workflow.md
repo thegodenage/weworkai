@@ -39,16 +39,22 @@ report, runs per stage (time, cost, last state, log link), spend against the tas
 and the span from the first run to the last.
 
 **Merge helper.** While the task waits for a human with a branch outside planning and
-coding (`Engine.mergeable?/1`: the gate, a stopped merger block, a failed merge), the
+coding, on a human block, a merger block or past its workflow's end
+(`Engine.mergeable?/1`; never on another agent block, whose step isn't done), the
 toolbar's `#merge-form` (`#merge-branch`, blank = the branch checked out in the
 repository; `#merge-task` "Merge with agent", disabled until a merger agent can run)
 calls `Board.merge_task(task, branch \\ nil)` (`Engine.merge/2`). The first runnable
 **merger** (role `merger`, stage `merging`, profile `merger`) runs in the repository and
 merges the worktree branch into the target with `--no-ff`, resolving conflicts (it
-aborts and reports `blocked` when one needs a decision). The task keeps its place: the
-result brings it back to the gate, so the human still decides; a merge records
-`merged_into` / `merge_commit` (`#merged-into` in the banner) and notifies `merged`, a
-blocked one `merge_blocked`. A merger block does the same without a human
+aborts and reports `blocked` when one needs a decision). The task keeps its place and
+its assignee: the result, or a failed run, brings it back to the gate as it was, so the
+human still decides. The job is on no block (`node_id` nil, so `restartable?/1` and the
+audit timeline leave it out of the gate's runs) and records its target
+(`jobs.merge_branch`); a reported merge into another branch (or none) counts as blocked.
+A merge records `merged_into` / `merge_commit` (only a hex hash; `#merged-into` in the
+banner) and notifies `merged`, a blocked one `merge_blocked`. On a stopped merger block a
+blank merge runs that block again (its target, its instructions; refused on a version
+with problems). A merger block does the same without a human
 (docs/workflows.md).
 
 Questions a human asks about a task (Ask tab) are answered beside this lifecycle and never

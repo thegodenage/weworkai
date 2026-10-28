@@ -63,11 +63,16 @@ defmodule Weworkai.Workflows.Graph do
   end
 
   @doc """
-  Whether `name` can be a git branch: letters, digits, `.`, `_`, `-` and `/` between
-  parts, no `..`, not starting with `-`, `/` or `.`, not ending with `/` or `.`.
+  Whether `name` can be a git branch (`git check-ref-format --branch`): letters, digits,
+  `.`, `_`, `-` and `/` between parts, no `..`, no part starting with `.` or ending with
+  `.lock`, not starting with `-` or `/`, not ending with `/` or `.`, and not `HEAD`.
   """
   def branch_name?(name) when is_binary(name),
-    do: Regex.match?(~r{\A(?![-/.])(?!.*(?:\.\.|//|/\.))[A-Za-z0-9._/-]+(?<![/.])\z}, name)
+    do:
+      Regex.match?(
+        ~r{\A(?![-/.])(?!HEAD\z)(?!.*(?:\.\.|//|/\.|\.lock(?:/|\z)))[A-Za-z0-9._/-]+(?<![/.])\z},
+        name
+      )
 
   def branch_name?(_name), do: false
 

@@ -107,10 +107,14 @@ the create form has no assignee.
   (docs/scheduler.md, "Timeouts").
 - **A merger block** (role `merger`) merges the task's branch with no human asked: into
   its `merge_branch` (`workflow_nodes.merge_branch`, the inspector's "Merge into"; blank =
-  the branch checked out in the task's repository). It needs a worktree (none: the task
-  waits on it, "Nothing to merge yet"). `merged` routes on (e.g. → Column Done); `blocked`
+  the branch checked out in the task's repository). It needs a worktree, "Nothing to merge
+  yet" otherwise: an arrow into it leaves the task waiting on it, and a workflow that
+  starts on it refuses the move to Todo, like one that starts on a reviewer. `merged` routes on (e.g. → Column Done); `blocked`
   (a conflict it can't settle, a dirty checkout, a missing branch) pauses on the block
-  unless an arrow takes it, and Continue runs it again. Only merger blocks may name a
+  unless an arrow takes it, and Continue (or a blank "Merge with agent", or one into its
+  own branch) runs it again. A merge there into another branch runs beside the graph and
+  leaves the task on the block. A reported merge into another branch than the one asked
+  for (or none) counts as `blocked`. Only merger blocks may name a
   branch, and it must look like one (`Graph.branch_name?/1`). Example automatic merge:
 
   ```

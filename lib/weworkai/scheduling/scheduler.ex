@@ -65,11 +65,33 @@ defmodule Weworkai.Scheduling.Scheduler do
   end
 
   # ponytail: start_run is a blocking bridge call inside the tick; move it to a Task.Supervisor if queued jobs pile up
+  # A merger run waits while another works in the same folder (both would merge in the
+  # same checkout); it stays due and starts on a later tick.
   def dispatch_due do
-    Enum.each(Scheduling.due_scheduled_jobs!(), fn attempt ->
-      isolate(attempt, &dispatch/1, fn attempt, reason ->
-        Engine.start_failed(attempt, StartFailure.transient(reason))
-      end)
+    merging = MapSet.new(Scheduling.running_merges!(), & &1.folder)
+
+    Enum.reduce(Scheduling.due_scheduled_jobs!(), merging, fn attempt, merging ->
+      case attempt.job do
+        %{stage: :merging, folder: folder} ->
+          if folder in merging do
+            merging
+          else
+            start(attempt)
+            MapSet.put(merging, folder)
+          end
+
+        _job ->
+          start(attempt)
+          merging
+      end
+    end)
+
+    :ok
+  end
+
+  defp start(attempt) do
+    isolate(attempt, &dispatch/1, fn attempt, reason ->
+      Engine.start_failed(attempt, StartFailure.transient(reason))
     end)
   end
 
