@@ -225,6 +225,7 @@ export function group(graph, ids, label) {
     prompt: null,
     stall_timeout_minutes: null,
     turn_timeout_minutes: null,
+    merge_branch: null,
     start: false,
     x: snap(box.x - GROUP.padding),
     y: snap(box.y - GROUP.header - GROUP.padding / 2),

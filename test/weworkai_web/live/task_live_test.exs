@@ -459,6 +459,30 @@ defmodule WeworkaiWeb.TaskLiveTest do
       refute has_element?(view, "#ready-to-merge")
     end
 
+    test "the merger merges the branch from the gate, which then waits for the human",
+         %{conn: conn, bridge: bridge, connector: connector} = context do
+      task = coded_task(context)
+      BridgeStub.step(bridge)
+
+      view = open(conn, ~p"/tasks/#{task.id}")
+      assert has_element?(view, "#merge-task[disabled]")
+
+      agent(connector, "Merger", :merger)
+      view = open(conn, ~p"/tasks/#{task.id}")
+      refute has_element?(view, "#merge-task[disabled]")
+
+      view |> form("#merge-form", %{branch: "main"}) |> render_submit()
+      assert %{stage: :merging} = Board.get_task!(task.id)
+      refute has_element?(view, "#merge-form")
+
+      BridgeStub.step(bridge)
+      render(view)
+
+      assert has_element?(view, "#merged-into", "main")
+      assert has_element?(view, "#mark-done")
+      assert has_element?(view, "#merge-form")
+    end
+
     test "open findings after the last fix round are pointed at", %{conn: conn} do
       task = Board.create_task!(%{title: "Rough"})
 

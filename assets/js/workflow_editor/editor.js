@@ -525,6 +525,7 @@ export function createEditor(hook) {
       prompt: null,
       stall_timeout_minutes: null,
       turn_timeout_minutes: null,
+      merge_branch: null,
       start: false,
       x: spot.x,
       y: spot.y,

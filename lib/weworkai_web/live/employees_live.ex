@@ -421,6 +421,13 @@ defmodule WeworkaiWeb.EmployeesLive do
               <.icon name="hero-eye-micro" class="size-4" />
               {Role.label(@configuring.agent.role)} agents run in a sandboxed container; the repository is mounted read-only.
             </p>
+            <p
+              :if={@configuring.agent.role == :merger}
+              class="mb-2 flex items-center gap-1.5 text-xs text-(--orpheus-text-muted)"
+            >
+              <.icon name="hero-arrows-pointing-in-micro" class="size-4" />
+              Merger agents get the whole repository writable: they merge task branches into its branches.
+            </p>
             <div class="mt-4 flex justify-end gap-2">
               <.button patch={list_path(@page_number)} class="btn btn-ghost btn-sm">Cancel</.button>
               <.button variant="primary" class="btn btn-primary btn-sm" phx-disable-with="Saving…">

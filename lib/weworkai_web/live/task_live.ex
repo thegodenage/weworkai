@@ -2,8 +2,8 @@ defmodule WeworkaiWeb.TaskLive do
   @moduledoc """
   A task's own page, where a human iterates with its agents: reviews the plan and its
   diffs, comments on steps and lines, answers decisions, hands the plan to a coder, reads
-  the reviewers' findings, marks a reviewed branch done, and asks agents questions about
-  the task (docs/workflow.md, "Human loop").
+  the reviewers' findings, has the merger merge a reviewed branch, marks it done, and asks
+  agents questions about the task (docs/workflow.md, "Human loop").
   """
   use WeworkaiWeb, :live_view
 
@@ -41,6 +41,7 @@ defmodule WeworkaiWeb.TaskLive do
            decision_comment: "",
            answers: %{},
            question: "",
+           merge_branch: "",
            repository_form: nil
          )
          |> load(task)}
@@ -93,9 +94,11 @@ defmodule WeworkaiWeb.TaskLive do
       max_fix_rounds: Engine.fix_round_limit(graph),
       continue_targets: Board.continue_targets(task),
       ready_to_merge?: Engine.ready_to_merge?(task),
+      mergeable?: Engine.mergeable?(task) and not Activity.workflow?(task.activity),
       pending_asks: length(Scheduling.active_asks!(task.id)),
       usage: Usage.total(Agents.task_usage!(task.id)),
-      answerer: Engine.answerer()
+      answerer: Engine.answerer(),
+      merger: Engine.merger()
     )
     |> then(&if(previous && previous.plan != task.plan, do: clear_selection(&1), else: &1))
     |> follow_default_tab()
@@ -312,6 +315,28 @@ defmodule WeworkaiWeb.TaskLive do
     end
   end
 
+  def handle_event("merge_branch", %{"branch" => branch}, socket) do
+    {:noreply, assign(socket, merge_branch: branch)}
+  end
+
+  def handle_event("merge", %{"branch" => branch}, socket) do
+    branch = if String.trim(branch) == "", do: nil, else: String.trim(branch)
+
+    case Board.merge_task(socket.assigns.task, branch) do
+      {:ok, task} ->
+        {:noreply,
+         socket
+         |> load(task)
+         |> put_flash(
+           :info,
+           "The merger merges #{task.worktree_branch} into #{branch || "the checked-out branch"}."
+         )}
+
+      {:error, error} ->
+        {:noreply, socket |> reload() |> put_flash(:error, ErrorText.readable(error))}
+    end
+  end
+
   def handle_event("mark_done", _params, socket) do
     case Board.move_task(socket.assigns.task, :done) do
       {:ok, task} -> {:noreply, socket |> load(task) |> put_flash(:info, "Marked done.")}
@@ -415,6 +440,7 @@ defmodule WeworkaiWeb.TaskLive do
   defp agent_name(:coding), do: "The coder"
   defp agent_name(:code_review), do: "The code reviewer"
   defp agent_name(:qa), do: "The docker reviewer"
+  defp agent_name(:merging), do: "The merger"
   defp agent_name(nil), do: "The agent"
 
   defp continued(%{status: :done}), do: "Marked done."
@@ -426,10 +452,22 @@ defmodule WeworkaiWeb.TaskLive do
   defp working_note(%{status: :review, stage: :qa}, _max),
     do: "is building and testing the change."
 
+  defp working_note(%{stage: :merging}, _max),
+    do: "is merging the branch and resolving any conflicts."
+
   defp working_note(%{stage: :coding, review_round: round}, max) when round > 0,
     do: "is fixing the reviewers' findings (fix round #{round} of #{max})."
 
   defp working_note(_task, _max), do: "is working on it."
+
+  defp merge_hint(nil),
+    do: "Add a Merger agent (with a model and a connector) on the Employees page first"
+
+  defp merge_hint(_merger),
+    do: "An agent merges the branch and resolves any conflicts; the task then waits for you again"
+
+  defp short_commit(commit) when commit in [nil, ""], do: nil
+  defp short_commit(commit), do: String.slice(commit, 0, 7)
 
   # Which conversation a question continues (Engine.ask_job/3).
   defp asked_context(task, answerer) do
@@ -720,6 +758,34 @@ defmodule WeworkaiWeb.TaskLive do
               <.icon name="hero-arrow-right-micro" class="size-4" /> {edge.condition}
             </button>
           </form>
+          <form
+            :if={@mergeable?}
+            id="merge-form"
+            phx-change="merge_branch"
+            phx-submit="merge"
+            class="flex items-center"
+          >
+            <input
+              id="merge-branch"
+              name="branch"
+              value={@merge_branch}
+              maxlength="255"
+              placeholder="checked-out branch"
+              aria-label="Branch to merge into"
+              title="Blank merges into the branch checked out in the repository"
+              class="input input-sm w-40 border-r-0 font-mono text-xs"
+            />
+            <button
+              id="merge-task"
+              type="submit"
+              disabled={is_nil(@merger)}
+              phx-disable-with="Asking…"
+              title={merge_hint(@merger)}
+              class="btn btn-outline btn-sm transition-transform active:scale-[0.98]"
+            >
+              <.icon name="hero-arrows-pointing-in-micro" class="size-4" /> Merge with agent
+            </button>
+          </form>
           <button
             :if={@ready_to_merge?}
             id="mark-done"
@@ -727,7 +793,7 @@ defmodule WeworkaiWeb.TaskLive do
             phx-click="mark_done"
             phx-disable-with="Marking…"
             class="btn btn-primary btn-sm shadow-sm shadow-primary/30 transition-transform active:scale-[0.98]"
-            title="You merged the branch; the task is done"
+            title="The branch is merged; the task is done"
           >
             <.icon name="hero-check-micro" class="size-4" /> Mark done
           </button>
@@ -776,7 +842,20 @@ defmodule WeworkaiWeb.TaskLive do
             id="ready-to-merge-branch"
             class="border border-(--orpheus-border) bg-base-200 px-1.5 py-0.5 text-xs"
             phx-no-format
-          >{@task.worktree_branch}</code>. Merge it, then mark the task done.
+          >{@task.worktree_branch}</code>. Merge it (or have the merger do it), then mark the task done.
+        </span>
+        <span
+          :if={@task.merged_into}
+          id="merged-into"
+          class="basis-full pl-8 text-(--orpheus-text-secondary)"
+        >
+          The merger merged it into <code
+            class="border border-(--orpheus-border) bg-base-200 px-1.5 py-0.5 text-xs"
+            phx-no-format
+          >{@task.merged_into}</code>
+          <span :if={short_commit(@task.merge_commit)} class="font-mono text-xs">
+            ({short_commit(@task.merge_commit)})
+          </span>
         </span>
       </div>
 

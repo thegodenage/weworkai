@@ -280,5 +280,6 @@ defmodule WeworkaiWeb.TaskComponents do
   defp worker(:coding), do: "Coder"
   defp worker(:code_review), do: "Reviewer"
   defp worker(:qa), do: "Docker reviewer"
+  defp worker(:merging), do: "Merger"
   defp worker(nil), do: "Agent"
 end
