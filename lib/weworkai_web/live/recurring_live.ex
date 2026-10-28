@@ -79,6 +79,15 @@ defmodule WeworkaiWeb.RecurringLive do
 
   defp refresh(socket), do: stream(socket, :crons, Recurring.list_crons!(), reset: true)
 
+  defp redraw(socket, cron_id) do
+    case Recurring.get_cron(cron_id,
+           load: [:workflow, :task_count, :last_task_id, :last_task_title]
+         ) do
+      {:ok, cron} -> stream_insert(socket, :crons, cron)
+      {:error, _gone} -> stream_delete_by_dom_id(socket, :crons, "crons-#{cron_id}")
+    end
+  end
+
   @impl true
   def handle_event("validate", %{"form" => params}, socket) do
     {:noreply, assign(socket, form: AshPhoenix.Form.validate(socket.assigns.form, days(params)))}
@@ -124,12 +133,13 @@ defmodule WeworkaiWeb.RecurringLive do
   end
 
   @impl true
-  def handle_info(:cron_changed, socket), do: {:noreply, refresh(socket)}
+  # Only the cron's row is drawn again. A fire's last write (`record_run`) comes after its
+  # task exists, so the row's count and last task follow.
+  def handle_info({:cron_changed, cron_id}, socket), do: {:noreply, redraw(socket, cron_id)}
 
-  # A cron's task changed or went: its row's count and last task follow.
-  def handle_info({event, %{cron_id: cron_id}}, socket)
-      when event in [:task_updated, :task_deleted] and not is_nil(cron_id),
-      do: {:noreply, refresh(socket)}
+  # One of a cron's tasks went: its count and last task change. (Updates don't.)
+  def handle_info({:task_deleted, %{cron_id: cron_id}}, socket) when not is_nil(cron_id),
+    do: {:noreply, redraw(socket, cron_id)}
 
   def handle_info(_message, socket), do: {:noreply, socket}
 

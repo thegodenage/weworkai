@@ -52,6 +52,54 @@ defmodule Weworkai.Recurring.RunnerTest do
       assert Runner.next_run(nightly, ~U[2026-10-25 01:10:00Z]) == ~U[2026-10-26 01:30:00Z]
     end
 
+    test "steps in the day and month fields count from 1, as cron's do" do
+      quarterly = expression("0 9 1 */3 *", "Etc/UTC")
+      assert Runner.next_run(quarterly, ~U[2026-10-28 00:00:00Z]) == ~U[2027-01-01 09:00:00Z]
+      assert Runner.next_run(quarterly, ~U[2027-01-01 09:00:00Z]) == ~U[2027-04-01 09:00:00Z]
+
+      odd_days = expression("0 9 */2 * *", "Etc/UTC")
+      assert Runner.next_run(odd_days, ~U[2026-10-29 10:00:00Z]) == ~U[2026-10-31 09:00:00Z]
+      assert Runner.next_run(odd_days, ~U[2026-10-31 10:00:00Z]) == ~U[2026-11-01 09:00:00Z]
+    end
+
+    test "a day of the month and a weekday both given: either one matching runs it" do
+      first_or_monday = expression("0 9 1 * 1", "Etc/UTC")
+      # Wed 28 Oct 2026: Sun 1 Nov is the 1st, Mon 2 Nov a Monday.
+      assert Runner.next_run(first_or_monday, ~U[2026-10-28 10:00:00Z]) ==
+               ~U[2026-11-01 09:00:00Z]
+
+      assert Runner.next_run(first_or_monday, ~U[2026-11-01 09:00:00Z]) ==
+               ~U[2026-11-02 09:00:00Z]
+    end
+
+    test "an every-hour expression goes on through the hour the clocks pass twice" do
+      runs = fn text ->
+        schedule = expression(text, "Europe/Warsaw")
+
+        ~U[2026-10-24 23:45:00Z]
+        |> Stream.unfold(fn from ->
+          {Runner.next_run(schedule, from), Runner.next_run(schedule, from)}
+        end)
+        |> Enum.take(5)
+      end
+
+      assert runs.("0 * * * *") == [
+               ~U[2026-10-25 00:00:00Z],
+               ~U[2026-10-25 01:00:00Z],
+               ~U[2026-10-25 02:00:00Z],
+               ~U[2026-10-25 03:00:00Z],
+               ~U[2026-10-25 04:00:00Z]
+             ]
+
+      assert runs.("*/30 * * * *") == [
+               ~U[2026-10-25 00:00:00Z],
+               ~U[2026-10-25 00:30:00Z],
+               ~U[2026-10-25 01:00:00Z],
+               ~U[2026-10-25 01:30:00Z],
+               ~U[2026-10-25 02:00:00Z]
+             ]
+    end
+
     test "any expression that parses and runs is a cron's, however often" do
       assert Runner.check_expression("0 9 * * 1-5") == :ok
       assert Runner.check_expression("* * * * *") == :ok
@@ -63,6 +111,12 @@ defmodule Weworkai.Recurring.RunnerTest do
       assert Runner.check_expression("@reboot") == {:error, "@reboot is not supported"}
       assert Runner.check_expression("0  9 * *   1-5") == :ok
       assert Runner.check_expression("@daily") == :ok
+
+      assert Runner.check_expression("30-10 * * * *") ==
+               {:error, "has a range that runs backwards"}
+
+      assert Runner.check_expression("0 9 * * 5-1") == {:error, "has a range that runs backwards"}
+      assert Runner.check_expression("@secondly") == {:error, "@secondly is not supported"}
 
       assert Runner.check_expression("0 0 9 * * *") ==
                {:error, "needs five fields: minute hour day-of-month month weekday"}
@@ -239,6 +293,36 @@ defmodule Weworkai.Recurring.RunnerTest do
 
     assert [%{group_id: nil}] = Board.list_tasks!()
     assert Board.list_task_groups!() == []
+  end
+
+  test "a due slot runs once when a tick and Run now both take it" do
+    cron = due_at!(cron!(human_workflow!()), ~U[2026-11-02 09:00:00Z])
+
+    # The page read the cron before the tick fired it: its Run now finds the slot taken.
+    :ok = Runner.start_due(~U[2026-11-02 09:01:00Z])
+    assert {:error, "it has just run or changed; try again"} = Runner.start(cron)
+    assert length(Board.list_tasks!()) == 1
+  end
+
+  test "an edit saved while a tick fires is not overwritten" do
+    cron = due_at!(cron!(human_workflow!()), ~U[2026-11-02 09:00:00Z])
+    Recurring.update_cron!(Recurring.get_cron!(cron.id), %{at: ~T[17:00:00]})
+
+    # The tick's copy is from before the edit.
+    assert {:error, _taken} = Runner.start(cron, ~U[2026-11-02 09:01:00Z], cron.next_run_at)
+    assert Board.list_tasks!() == []
+    assert Recurring.get_cron!(cron.id).next_run_at.hour == 17
+  end
+
+  test "long names still make a notification" do
+    workflow =
+      Workflows.rename_workflow!(Workflows.default_workflow!(), String.duplicate("w", 100))
+
+    cron = cron!(workflow, %{name: String.duplicate("c", 180)})
+
+    assert {:error, _reason} = Runner.start(cron)
+    assert [%{kind: :cron_failed, title: title}] = Notifications.recent_notifications!()
+    assert String.length(title) <= 300
   end
 
   test "a cron's tasks keep its time zone once it is deleted" do

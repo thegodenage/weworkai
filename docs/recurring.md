@@ -12,8 +12,12 @@ interactions, every half hour during the day to check for comments on posts. The
   - `expression` ("Cron expression"): five fields, minute hour day-of-month month weekday
     (`0 9 * * 1-5`, `*/30 8-18 * * *`, `@hourly`), parsed by `crontab`, any spaces between
     them. Any that parses and ever matches is accepted, however often it runs (runs close
-    together are grouped); a sixth field (crontab would read it as a year, not seconds)
-    and `@reboot` are refused. The form previews its next three runs, with the year when
+    together are grouped). It reads as cron reads it: a step in the day or month field
+    counts from 1 (`*/3` months: Jan, Apr, Jul, Oct), and with both a day of the month
+    and a weekday given, either matching runs it (`0 9 1 * 1`: the 1st and every Monday).
+    Refused: a sixth field (crontab would read it as a year, not seconds), a range that
+    runs backwards (`30-10`, which crontab reads as every value), and @ names other than
+    `@yearly`, `@annually`, `@monthly`, `@weekly`, `@daily`, `@midnight`, `@hourly`. The form previews its next three runs, with the year when
     it isn't this one;
 - the **task** it creates: `name` (the title, with the slot's day, and its time too for an
   expression: "Daily GitLab digest · Wed 28 Oct", "Inbox · Wed 28 Oct 14:30"),
@@ -25,10 +29,13 @@ Code: `lib/weworkai/recurring/` (Ash domain `Weworkai.Recurring`; `Cron`, `Runne
 
 - `next_run_at` (UTC) is the cron's next slot (`Runner.next_run/2`), recomputed on every
   save and fire; a paused cron has none. A time DST skips runs when the clocks resume; one
-  they pass twice, the first time, and an expression's match in the repeated hour never
-  fires twice.
+  they pass twice, the first time only, except for an expression with a `*` hour (`0 * * * *`,
+  `*/30 * * * *`), which goes on through the repeated hour as cron does, so it loses no
+  runs (nor its day's stack).
 - The scheduler's tick (docs/scheduler.md) calls `Runner.start_due/1` first. A due cron is
-  **claimed** (`last_run_at`, the next `next_run_at`) before its task is created
+  **claimed** (`last_run_at`, the next `next_run_at`; only while `next_run_at` is still the
+  one read, so a tick and a Run now on the same slot, or an edit saved meanwhile, make one
+  run, not two) before its task is created
   (`Task.create_from_cron`) and **moved to todo**, exactly as a person moving it would: the
   workflow's version, problems and refusals apply. Every run creates its own task, whether
   or not the last one is still open.
@@ -68,7 +75,8 @@ puts them all back. A group goes when its last task leaves it (`DropEmptyGroup`)
   run's group when it comes at most 60 minutes after it on the same day of the cron's
   clock (`Runner.group_gap_minutes/0`), so a half-hourly cron leaves one stack a day. The
   second close run creates the group ("Inbox · Wed 28 Oct", `cron_id` set) and moves the
-  first into it, once the second exists. A run a person moved into a group of their own
+  first into it, once the second exists. Grouping is best effort: when it fails (the
+  first run was just deleted), the new run goes on ungrouped and still starts. A run a person moved into a group of their own
   starts none; one a person took out of a group (Ungroup, or "No group": `tasks.apart`)
   starts none either, and the day's runs after it stay apart too.
 - **Any tasks** can be grouped from the board drawer's Group control: an existing group,

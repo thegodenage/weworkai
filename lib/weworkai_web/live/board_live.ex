@@ -252,6 +252,7 @@ defmodule WeworkaiWeb.BoardLive do
        |> update(:placements, &Map.delete(&1, task.id))
        |> update(:working, &Map.delete(&1, task.id))
        |> update(:shown, &MapSet.delete(&1, task.id))
+       |> put_tags(task.id, nil)
        |> put_flash(:info, "Task deleted.")
        |> push_patch(to: ~p"/")}
     else
@@ -298,6 +299,7 @@ defmodule WeworkaiWeb.BoardLive do
           |> update(:placements, &Map.delete(&1, task.id))
           |> update(:working, &Map.delete(&1, task.id))
           |> update(:shown, &MapSet.delete(&1, task.id))
+          |> put_tags(task.id, nil)
 
         :error ->
           socket
@@ -336,7 +338,7 @@ defmodule WeworkaiWeb.BoardLive do
     |> regroup(task.id, task, [previous, task.status])
     |> update(:placements, &Map.put(&1, task.id, task.status))
     |> update(:working, &track_working(&1, task))
-    |> update(:tag_options, &Enum.sort(Enum.uniq(&1 ++ task.tags)))
+    |> put_tags(task.id, task.tags)
     |> then(
       &if(&1.assigns.task && &1.assigns.task.id == task.id,
         do: assign_drawer_task(&1, task),
@@ -490,10 +492,23 @@ defmodule WeworkaiWeb.BoardLive do
       member_of: Map.new(grouped, &{&1.id, &1.group_id}),
       # Stacks a change left to draw again (`flush_stacks/1`).
       stale_stacks: MapSet.new(),
-      # Every tag in use, for the tag filter.
-      tag_options: tasks |> Enum.flat_map(& &1.tags) |> Enum.uniq() |> Enum.sort()
+      # Each task's tags, and every tag in use: the tag filter's options.
+      task_tags: Map.new(tasks, &{&1.id, &1.tags}),
+      tag_options: tag_options(tasks |> Enum.map(& &1.tags))
     )
   end
+
+  # `nil`: the task went. A tag no task has any more leaves the filter.
+  defp put_tags(socket, task_id, tags) do
+    task_tags =
+      if tags,
+        do: Map.put(socket.assigns.task_tags, task_id, tags),
+        else: Map.delete(socket.assigns.task_tags, task_id)
+
+    assign(socket, task_tags: task_tags, tag_options: tag_options(Map.values(task_tags)))
+  end
+
+  defp tag_options(tag_lists), do: tag_lists |> List.flatten() |> Enum.uniq() |> Enum.sort()
 
   defp matches?(task, filters) do
     text?(task, filters["q"]) and filters["workflow"] in ["", task.workflow_id] and

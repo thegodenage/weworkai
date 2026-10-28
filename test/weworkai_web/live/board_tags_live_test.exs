@@ -24,6 +24,12 @@ defmodule WeworkaiWeb.BoardTagsLiveTest do
     view |> form("#board-filters", filter: %{tag: "gitlab"}) |> render_change()
     assert has_element?(view, "#task-link-#{task.id}")
     refute has_element?(view, "#task-link-#{other.id}")
+
+    # A tag no task has any more leaves the filter.
+    assert has_element?(view, ~s|#board-filter-tag option[value="daily"]|)
+    Board.update_task!(Board.get_task!(task.id), %{tags: ["gitlab"]})
+    _ = render(view)
+    refute has_element?(view, ~s|#board-filter-tag option[value="daily"]|)
   end
 
   test "a cron's task arrives on the board tagged CRON, with its scheduled time", %{conn: conn} do

@@ -75,8 +75,18 @@ defmodule Weworkai.Recurring.Cron do
 
     # It fired or skipped a slot: the next one is set before any task is made, so a run
     # that fails or raises is never repeated on the next tick.
+    # Only while its next slot is still the one read: a tick and a Run now on the same slot,
+    # or an edit saved meanwhile, leave it to the first write (the other gets a stale record).
     update :claim do
       accept [:last_run_at, :next_run_at, :last_skipped_at]
+      require_atomic? false
+
+      change fn changeset, _context ->
+        case changeset.data.next_run_at do
+          nil -> Ash.Changeset.filter(changeset, expr(is_nil(next_run_at)))
+          slot -> Ash.Changeset.filter(changeset, expr(next_run_at == ^slot))
+        end
+      end
     end
 
     update :record_run do
@@ -88,7 +98,7 @@ defmodule Weworkai.Recurring.Cron do
   pub_sub do
     module Phoenix.PubSub
     name Weworkai.PubSub
-    transform fn _notification -> :cron_changed end
+    transform fn notification -> {:cron_changed, notification.data.id} end
 
     publish_all :create, "crons"
     publish_all :update, "crons"

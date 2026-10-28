@@ -30,7 +30,8 @@ defmodule Weworkai.Recurring.Runner do
   The schedule's first slot after `from`, in UTC: `%{mode: :weekly, days, at, timezone}`
   (ISO weekdays, 1 = Monday) or `%{mode: :expression, expression, timezone}`; nil for an
   expression that never matches. Both run on the zone's wall clock: a time the clocks skip
-  (DST) runs when they resume, one they pass twice the first time.
+  (DST) runs when they resume; one they pass twice runs the first time, unless the
+  expression runs every hour (a `*` hour), which goes on through the repeated hour too.
   """
   @spec next_run(map(), DateTime.t()) :: DateTime.t() | nil
   def next_run(%{mode: :expression} = schedule, from) do
@@ -45,64 +46,133 @@ defmodule Weworkai.Recurring.Runner do
     0..7
     |> Stream.map(&Date.add(today, &1))
     |> Stream.filter(&(Date.day_of_week(&1) in schedule.days))
-    |> Stream.map(&local(&1, schedule.at, schedule.timezone))
+    |> Stream.map(&(&1 |> moments(schedule.at, schedule.timezone) |> hd()))
     |> Enum.find(&(DateTime.compare(&1, from) == :gt))
     |> DateTime.shift_zone!("Etc/UTC")
   end
 
-  # The expression is matched on the local clock from the minute after `from`. A match in
-  # the hour the clocks pass twice can land at or before `from` (its first moment came
-  # already): that one is passed over, so nothing fires twice.
-  defp next_match(expression, timezone, from) do
+  # The expression is matched on the local clock from `from`'s own minute, keeping the
+  # first moment after `from`: a local time the clocks pass twice is two moments, the
+  # second taken only by an every-hour expression. With both a day of the month and a
+  # weekday given, either matching will do (as cron has it): the earlier of the two.
+  defp next_match(%{alternatives: alternatives, every_hour?: every_hour?}, timezone, from) do
     local_from = from |> DateTime.shift_zone!(timezone) |> DateTime.to_naive()
-    start = NaiveDateTime.add(%{local_from | second: 0, microsecond: {0, 0}}, 60)
-    match_from(expression, timezone, from, start)
+    start = %{local_from | second: 0, microsecond: {0, 0}}
+
+    # Within a repeated hour, the earlier local times of it are still to come a second time.
+    start =
+      if length(moments(NaiveDateTime.to_date(start), NaiveDateTime.to_time(start), timezone)) ==
+           2,
+         do: NaiveDateTime.add(start, -3600),
+         else: start
+
+    alternatives
+    |> Enum.map(&match_from(&1, every_hour?, timezone, from, start))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.min(DateTime, fn -> nil end)
   end
 
-  defp match_from(expression, timezone, from, start) do
+  # A second moment of a repeated hour comes after the first moments of the later times in
+  # that hour: the search goes on until a match's first moment is past the best one found.
+  defp match_from(expression, every_hour?, timezone, from, start, best \\ nil) do
     case Crontab.Scheduler.get_next_run_date(expression, start) do
       {:ok, naive} ->
-        moment = local(NaiveDateTime.to_date(naive), NaiveDateTime.to_time(naive), timezone)
+        [first | _] =
+          moments = moments(NaiveDateTime.to_date(naive), NaiveDateTime.to_time(naive), timezone)
 
-        if DateTime.compare(moment, from) == :gt,
-          do: DateTime.shift_zone!(moment, "Etc/UTC"),
-          else: match_from(expression, timezone, from, NaiveDateTime.add(naive, 60))
+        if best && DateTime.compare(first, best) != :lt do
+          DateTime.shift_zone!(best, "Etc/UTC")
+        else
+          moments = if every_hour?, do: moments, else: [first]
+          found = Enum.find(moments, &(DateTime.compare(&1, from) == :gt))
+          best = Enum.min([best, found] |> Enum.reject(&is_nil/1), DateTime, fn -> nil end)
+          match_from(expression, every_hour?, timezone, from, NaiveDateTime.add(naive, 60), best)
+        end
 
       {:error, _never} ->
-        nil
+        best && DateTime.shift_zone!(best, "Etc/UTC")
     end
   end
 
-  defp local(date, time, timezone) do
+  # The moments a local time is: one, two when the clocks pass it twice, or when they skip
+  # it, the one they resume at.
+  defp moments(date, time, timezone) do
     case DateTime.new(date, time, timezone) do
-      {:ok, datetime} -> datetime
-      {:ambiguous, first, _second} -> first
-      {:gap, _before, resumed} -> resumed
+      {:ok, datetime} -> [datetime]
+      {:ambiguous, first, second} -> [first, second]
+      {:gap, _before, resumed} -> [resumed]
     end
   end
 
-  # Five fields, however far apart; a sixth would be read as a year (`0 0 9 * * *` is not
-  # 9:00 daily but midnight on the 9th), so it is refused, as is `@reboot`, which parses
-  # but has no dates.
+  @specials ~w(@yearly @annually @monthly @weekly @daily @midnight @hourly)
+
+  # Five fields, however far apart, or one of cron's @ names. A sixth field would be read
+  # as a year (`0 0 9 * * *` is not 9:00 daily but midnight on the 9th), and a range that
+  # runs backwards (`30-10`) as every value, so both are refused.
   defp parse(expression) do
     fields = String.split(expression)
 
-    case Parser.parse(Enum.join(fields, " ")) do
-      {:ok, %{reboot: true}} ->
-        {:error, "@reboot is not supported"}
-
-      {:ok, parsed} ->
-        if special?(fields) or length(fields) == 5,
-          do: {:ok, parsed},
-          else: {:error, "needs five fields: minute hour day-of-month month weekday"}
-
-      {:error, _message} ->
-        {:error, "is not a valid cron expression"}
+    with :ok <- check_fields(fields),
+         {:ok, parsed} <- crontab(Enum.join(fields, " ")),
+         :ok <- check_ranges(parsed) do
+      {:ok, compile(parsed)}
     end
   end
 
-  defp special?([<<"@", _rest::binary>>]), do: true
-  defp special?(_fields), do: false
+  defp check_fields([<<"@", _rest::binary>> = special]) do
+    if special in @specials, do: :ok, else: {:error, "#{special} is not supported"}
+  end
+
+  defp check_fields(fields) when length(fields) == 5, do: :ok
+  defp check_fields(fields) when length(fields) > 5, do: {:error, five_fields()}
+  defp check_fields(_fields), do: {:error, "is not a valid cron expression"}
+
+  defp five_fields, do: "needs five fields: minute hour day-of-month month weekday"
+
+  defp crontab(text) do
+    case Parser.parse(text) do
+      {:ok, parsed} -> {:ok, parsed}
+      {:error, _message} -> {:error, "is not a valid cron expression"}
+    end
+  end
+
+  defp check_ranges(parsed) do
+    backwards? =
+      [parsed.minute, parsed.hour, parsed.day, parsed.month, parsed.weekday]
+      |> List.flatten()
+      |> Enum.any?(fn
+        {:-, low, high} when is_integer(low) and is_integer(high) -> low > high
+        {:/, {:-, low, high}, _step} when is_integer(low) and is_integer(high) -> low > high
+        _value -> false
+      end)
+
+    if backwards?, do: {:error, "has a range that runs backwards"}, else: :ok
+  end
+
+  # crontab counts a `*/n` step in the day and month fields from 0; cron counts from 1
+  # (`*/3` months: Jan, Apr, Jul, Oct).
+  defp compile(parsed) do
+    expression = %{
+      parsed
+      | day: Enum.map(parsed.day, &from_one(&1, 31)),
+        month: Enum.map(parsed.month, &from_one(&1, 12))
+    }
+
+    alternatives =
+      if star?(parsed.day) or star?(parsed.weekday),
+        do: [expression],
+        else: [%{expression | weekday: [:*]}, %{expression | day: [:*]}]
+
+    %{alternatives: alternatives, every_hour?: star?(parsed.hour)}
+  end
+
+  defp from_one({:/, :*, step}, last), do: {:/, {:-, 1, last}, step}
+  defp from_one(value, _last), do: value
+
+  # A field cron reads as unrestricted: `*`, or a step over `*`.
+  defp star?([:*]), do: true
+  defp star?([{:/, :*, _step}]), do: true
+  defp star?(_values), do: false
 
   @doc "`:ok` for an expression a cron may run on: it parses and matches some date; else why not."
   @spec check_expression(String.t()) :: :ok | {:error, String.t()}
@@ -174,7 +244,15 @@ defmodule Weworkai.Recurring.Runner do
         fire(cron, now, slot, %{last_skipped_at: missed})
 
       _none_come ->
-        Recurring.claim_cron!(cron, %{next_run_at: first, last_skipped_at: missed})
+        claim(cron, %{next_run_at: first, last_skipped_at: missed})
+    end
+  end
+
+  # `:taken` when another run (a tick, a Run now) or an edit got to the cron first.
+  defp claim(cron, attrs) do
+    case Recurring.claim_cron(cron, attrs) do
+      {:ok, cron} -> {:ok, cron}
+      {:error, _stale} -> :taken
     end
   end
 
@@ -201,13 +279,10 @@ defmodule Weworkai.Recurring.Runner do
     do: fire(cron, now, slot || now, missed_seen(cron))
 
   defp fire(cron, now, slot, claim) do
-    cron =
-      Recurring.claim_cron!(
-        cron,
-        Map.merge(%{last_run_at: now, next_run_at: next_slot(cron, now)}, claim)
-      )
+    attrs = Map.merge(%{last_run_at: now, next_run_at: next_slot(cron, now)}, claim)
 
-    with {:ok, task} <- create_task(cron, slot) do
+    with {:ok, cron} <- claim(cron, attrs),
+         {:ok, task} <- create_task(cron, slot) do
       case Board.move_task(task, :todo) do
         {:ok, started} ->
           Recurring.record_cron_run!(cron, %{last_error: nil})
@@ -217,6 +292,7 @@ defmodule Weworkai.Recurring.Runner do
           failed!(cron, task, ErrorText.readable(error))
       end
     else
+      :taken -> {:error, "it has just run or changed; try again"}
       {:error, error} -> failed!(cron, nil, ErrorText.readable(error))
     end
   end
@@ -280,22 +356,43 @@ defmodule Weworkai.Recurring.Runner do
 
     with {:ok, task} <- Board.create_cron_task(attrs) do
       case grouping do
-        {:start, previous} -> start_group(cron, previous, task)
+        {:start, previous} -> {:ok, start_group(cron, previous, task)}
         _other -> {:ok, task}
       end
     end
   end
 
-  # The second close run: a group named for the cron and the day, both runs in it.
+  # The second close run: a group named for the cron and the day, both runs in it. Only a
+  # nicety: when it can't be made (the previous run was just deleted…), the new run goes on
+  # ungrouped, and still starts.
   defp start_group(cron, previous, task) do
     day =
       previous.cron_run_at
       |> DateTime.shift_zone!(cron.timezone)
       |> Calendar.strftime("%a %d %b")
 
-    group = Board.create_cron_task_group!(%{name: "#{cron.name} · #{day}", cron_id: cron.id})
-    Board.group_task!(previous, group.id)
-    Board.group_task(task, group.id)
+    with {:ok, group} <-
+           Board.create_cron_task_group(%{name: "#{cron.name} · #{day}", cron_id: cron.id}),
+         {:ok, _previous} <- grouped(previous, group),
+         {:ok, grouped} <- Board.group_task(task, group.id) do
+      grouped
+    else
+      {:error, error} ->
+        Logger.warning("Recurring: cron #{cron.id} didn't group its runs: #{inspect(error)}")
+        task
+    end
+  rescue
+    error ->
+      Logger.warning("Recurring: cron #{cron.id} didn't group its runs: #{inspect(error)}")
+      task
+  end
+
+  # A group the previous run couldn't join is dropped again.
+  defp grouped(previous, group) do
+    with {:error, error} <- Board.group_task(previous, group.id) do
+      Board.destroy_task_group(group)
+      {:error, error}
+    end
   end
 
   # The slot on the cron's own clock: its day, and the time too when it runs on an
@@ -313,10 +410,15 @@ defmodule Weworkai.Recurring.Runner do
     Notifications.notify!(%{
       task_id: task && task.id,
       kind: :cron_failed,
-      title: "Cron “#{cron.name}” didn't start “#{workflow.name}”",
+      title: "Cron “#{clip(cron.name, 120)}” didn't start “#{clip(workflow.name, 120)}”",
       body: reason
     })
 
     {:error, reason}
+  end
+
+  # Within the notification title's 300 characters, whatever the names.
+  defp clip(text, max) do
+    if String.length(text) > max, do: String.slice(text, 0, max - 1) <> "…", else: text
   end
 end
