@@ -75,6 +75,53 @@ defmodule Weworkai.Workflows.Prompts do
     """)
   end
 
+  ## Merger
+
+  @doc """
+  Merges the task's worktree branch into `branch` (nil: the branch checked out in the
+  repository). The run's folder is the repository, which holds the worktree too.
+  """
+  def merge(task, branch, step \\ nil) do
+    target =
+      if branch,
+        do: "`#{branch}`",
+        else: "the branch checked out in the repository (`git branch --show-current`)"
+
+    fit("""
+    You are the merger. Merge the task's branch `#{task.worktree_branch}` (its worktree:
+    `#{task.worktree_path}`) into #{target}. Your working directory is the repository
+    `#{task.repository}`; its git directory and every worktree in it are writable.
+
+    1. In the task's worktree, commit any uncommitted work on `#{task.worktree_branch}`
+       (leave `.weworkai/` out).
+    2. Find where the target branch is checked out (`git worktree list`):
+       - in the repository or another worktree: merge there, but only if it has no
+         uncommitted changes (ignoring `.weworkai/`); otherwise change nothing and finish
+         `blocked`;
+       - nowhere: add a temporary worktree for it under `.weworkai/merge/`, merge there,
+         and remove that worktree before you finish, also when you stop;
+       - a branch that doesn't exist: finish `blocked`. Never create it.
+    3. `git merge --no-ff #{task.worktree_branch}`. Resolve every conflict by keeping the
+       intent of both sides: read the plan below and both branches' history (`git log`).
+       Run the tests that cover what conflicted and fix what the merge broke.
+    4. Commit the merge. Never rebase, never force, never push to a remote, and change no
+       branch but the target. A target that already contains the branch is merged as it is.
+    5. If a conflict needs a decision the code and the plan don't settle, run
+       `git merge --abort` so the target is left as it was, and finish `blocked`.
+
+    Finish with `status` (`merged` or `blocked`), a markdown `summary` (what was merged,
+    each conflict and how you resolved it, or why you stopped and what a human must do),
+    `branch` (the target branch's name) and `commit` (the merge commit's hash; empty when
+    blocked).
+
+    #{step_section(step)}#{task_section(task)}
+
+    # Approved plan
+
+    #{render_plan(task.plan)}
+    """)
+  end
+
   ## Planner or coder, continued by a human (after a failure, or when it seemed stuck)
 
   def carry_on do
@@ -348,9 +395,21 @@ defmodule Weworkai.Workflows.Prompts do
     }
   }
 
+  @merge %{
+    "type" => "object",
+    "required" => ["status", "summary", "branch", "commit"],
+    "properties" => %{
+      "status" => %{"type" => "string", "enum" => ["merged", "blocked"]},
+      "summary" => %{"type" => "string"},
+      "branch" => %{"type" => "string"},
+      "commit" => %{"type" => "string"}
+    }
+  }
+
   def schema(:planning), do: @plan
   def schema(:coding), do: @outcome
   def schema(stage) when stage in [:code_review, :qa], do: @findings
+  def schema(:merging), do: @merge
   def schema(nil), do: nil
 
   ## Rendering

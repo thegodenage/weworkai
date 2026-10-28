@@ -6,6 +6,8 @@ defmodule Weworkai.Notifications.Notification.Kind do
       needs_answers: [description: "An agent waits for answers"],
       ready_for_review: [description: "A custom agent is done; a human reviews"],
       ready_to_merge: [description: "The reviewers are done; the branch waits to be merged"],
+      merged: [description: "The merger merged the task's branch"],
+      merge_blocked: [description: "The merger could not merge the task's branch"],
       answer_ready: [description: "An agent answered a question about the task"],
       stage_skipped: [description: "No agent for a review stage, so it was skipped"],
       agent_failed: [description: "An agent run failed"],

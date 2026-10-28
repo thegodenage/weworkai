@@ -45,7 +45,8 @@ defmodule Weworkai.Workflows.Node do
         :color,
         :prompt,
         :stall_timeout_minutes,
-        :turn_timeout_minutes
+        :turn_timeout_minutes,
+        :merge_branch
       ]
     end
   end
@@ -80,6 +81,12 @@ defmodule Weworkai.Workflows.Node do
     # An agent block's limits on each run (`Weworkai.Scheduling.Timeout`); nil keeps the job's default.
     attribute :stall_timeout_minutes, :integer, public?: true, constraints: [min: 1, max: 1440]
     attribute :turn_timeout_minutes, :integer, public?: true, constraints: [min: 1, max: 1440]
+
+    # A merger block's target branch; nil merges into the branch checked out in the repository.
+    attribute :merge_branch, :string do
+      public? true
+      constraints max_length: 255
+    end
   end
 
   relationships do

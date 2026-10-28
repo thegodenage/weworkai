@@ -1,6 +1,13 @@
 defmodule Weworkai.Agents.Agent.Role do
   use Ash.Type.Enum,
-    values: [planner: [], coder: [], reviewer: [], qa: [label: "Docker reviewer"], custom: []]
+    values: [
+      planner: [],
+      coder: [],
+      reviewer: [],
+      qa: [label: "Docker reviewer"],
+      merger: [],
+      custom: []
+    ]
 
   @read_only [:planner, :reviewer]
 
@@ -8,6 +15,11 @@ defmodule Weworkai.Agents.Agent.Role do
     planner: """
     Always write the code changes in the plan if there are any: for each change, show the \
     code you will write and the file it belongs to.\
+    """,
+    merger: """
+    Merge with `git merge --no-ff`. Never rebase, never force and never push to a remote. \
+    Resolve conflicts by keeping the intent of both sides; when that is unclear, abort the \
+    merge and report it blocked instead of guessing.\
     """
   }
 

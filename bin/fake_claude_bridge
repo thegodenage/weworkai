@@ -7,6 +7,7 @@ structured result picked by its profile:
   planner → a two-step plan with one question; resumed planner → revised plan, no questions
   coder   → done                 ("[fake:blocked]" in the prompt → blocked with a question)
   reviewer, qa → no findings     ("[fake:findings]" in the prompt → two findings)
+  merger → merged                ("[fake:conflict]" in the prompt → blocked)
   question (planner / reviewer run without a jsonSchema, forked or not)
           → "Fake answer to: <first line after the prompt's "# Question" heading>"
   any     → "[fake:fail]" in the prompt → the run fails
@@ -40,7 +41,7 @@ SLOW_RUN_SECONDS = 8
 MODELS = [{"id": "haiku", "label": "Haiku (latest)"}, {"id": "sonnet", "label": "Sonnet (latest)"},
           {"id": "opus", "label": "Opus (latest)"}, {"id": "claude-opus-5-5", "label": "Opus 5.5"}]
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
-PROFILES = {"planner", "coder", "reviewer", "qa", "custom"}
+PROFILES = {"planner", "coder", "reviewer", "qa", "merger", "custom"}
 # The real bridge's limits.
 MAX_PROMPT = 400_000
 # Attachments (at most 100 MB per task) arrive base64 encoded, a third larger.
@@ -52,6 +53,7 @@ USAGE = {
     "coder": (9_800, 6_400, 182_000, 21_500, 0.4127, 23),
     "reviewer": (5_100, 1_200, 64_000, 8_800, 0.1348, 9),
     "qa": (5_100, 1_200, 64_000, 8_800, 0.1348, 9),
+    "merger": (3_400, 1_100, 30_000, 4_200, 0.0710, 7),
     "custom": (2_000, 900, 20_000, 3_000, 0.0450, 4),
     "question": (1_100, 320, 12_000, 2_400, 0.0215, 2),
 }
@@ -107,6 +109,11 @@ def outcome(prompt, profile, resumed):
         return plan(resumed)
     if profile in ("reviewer", "qa"):
         return findings("[fake:findings]" in prompt)
+    if profile == "merger":
+        if "[fake:conflict]" in prompt:
+            return {"status": "blocked", "summary": "A conflict in lib/app.ex needs a decision.",
+                    "branch": "main", "commit": ""}
+        return {"status": "merged", "summary": "Merged cleanly.", "branch": "main", "commit": "a" * 40}
     if profile == "coder" and "[fake:blocked]" in prompt:
         return {"status": "blocked", "summary": "Need a decision.",
                 "questions": [{"id": "q1", "question": "Which database?", "options": ["Postgres", "SQLite"]}]}

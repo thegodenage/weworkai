@@ -79,6 +79,18 @@ defmodule Weworkai.BridgeStub do
     %{"status" => status, "summary" => "Implemented the plan.", "questions" => questions}
   end
 
+  @doc "A merger's result: `merged` into `branch`, or `blocked` on a conflict."
+  def merge(status \\ "merged", branch \\ "main") do
+    merged? = status == "merged"
+
+    %{
+      "status" => status,
+      "summary" => if(merged?, do: "Merged cleanly.", else: "A conflict needs a decision."),
+      "branch" => branch,
+      "commit" => if(merged?, do: String.duplicate("a", 40), else: "")
+    }
+  end
+
   def findings(count) do
     %{
       "summary" => "#{count} findings.",
@@ -106,6 +118,7 @@ defmodule Weworkai.BridgeStub do
   defp default("planner", %{"resume" => nil}), do: plan()
   defp default("planner", _body), do: plan([])
   defp default("coder", _body), do: outcome()
+  defp default("merger", _body), do: merge()
   defp default(_reviewer, _body), do: findings(0)
 
   defp handle(conn, test, state) do

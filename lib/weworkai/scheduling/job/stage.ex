@@ -9,6 +9,7 @@ defmodule Weworkai.Scheduling.Job.Stage do
       coding: [],
       code_review: [label: "Code review"],
       qa: [label: "QA"],
+      merging: [],
       ask: [label: "Question"]
     ]
 end

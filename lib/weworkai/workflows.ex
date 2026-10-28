@@ -176,7 +176,8 @@ defmodule Weworkai.Workflows do
             :color,
             :prompt,
             :stall_timeout_minutes,
-            :turn_timeout_minutes
+            :turn_timeout_minutes,
+            :merge_branch
           ])
         end),
       edges:
@@ -318,7 +319,8 @@ defmodule Weworkai.Workflows do
           :color,
           :prompt,
           :stall_timeout_minutes,
-          :turn_timeout_minutes
+          :turn_timeout_minutes,
+          :merge_branch
         ])
         |> Map.merge(%{id: ids[node.id], workflow_id: workflow_id, group_id: ids[node.group_id]})
       end)

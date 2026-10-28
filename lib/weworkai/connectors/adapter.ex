@@ -66,7 +66,7 @@ defmodule Weworkai.Connectors.Adapter do
           folder: String.t(),
           model: String.t(),
           effort: String.t() | nil,
-          profile: :planner | :coder | :reviewer | :qa | :custom,
+          profile: :planner | :coder | :reviewer | :qa | :merger | :custom,
           system_prompt: String.t() | nil,
           task: String.t(),
           json_schema: map() | nil,

@@ -45,8 +45,10 @@ defmodule Weworkai.Board.Task.Changes.Transition do
     end
   end
 
-  # A version with problems runs nothing; Continue can still mark the task done.
+  # A version with problems runs nothing; Continue can still mark the task done, and a
+  # merge (beside the graph) still runs.
   defp runnable(_task, :continue, %{target: "done"}), do: :ok
+  defp runnable(_task, :merge, _arguments), do: :ok
 
   defp runnable(task, _step, _arguments) do
     case Workflows.running!(task) do
