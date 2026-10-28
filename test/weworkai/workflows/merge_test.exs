@@ -5,7 +5,7 @@ defmodule Weworkai.Workflows.MergeTest do
   @moduletag :capture_log
 
   alias Weworkai.{Agents, Board, BridgeStub, Connectors, ErrorText, Notifications}
-  alias Weworkai.{Organization, Workflows}
+  alias Weworkai.{Organization, Scheduling, Workflows}
   alias Weworkai.Workflows.Engine
 
   setup do
@@ -98,6 +98,9 @@ defmodule Weworkai.Workflows.MergeTest do
 
       assert %{author: :agent, agent_role: :merger, kind: :outcome} =
                List.last(Board.list_messages!(task.id))
+
+      # On no block, so the audit timeline shows a merge, not a run of the gate.
+      assert %{stage: :merging, node_id: nil} = Scheduling.latest_job!(task.id)
     end
 
     test "a blocked merge leaves the gate as it was",
@@ -194,6 +197,61 @@ defmodule Weworkai.Workflows.MergeTest do
       assert %{status: :await_human_supervision, stage: :merging} = task
       assert task.current_node.label == "Merge"
       assert Engine.mergeable?(task)
+    end
+
+    test "a blank merge on a stopped block runs the block again, into its own branch",
+         %{bridge: bridge} = context do
+      BridgeStub.queue(bridge, "merger", BridgeStub.merge("blocked", "release"))
+      task = auto_merge!(context)
+      BridgeStub.step(bridge)
+      BridgeStub.step(bridge)
+      started_runs()
+
+      task = Board.merge_task!(Board.get_task!(task.id))
+      BridgeStub.queue(bridge, "merger", BridgeStub.merge("merged", "release"))
+      BridgeStub.step(bridge)
+
+      assert [%{"prompt" => prompt}] = started_runs()
+      assert prompt =~ "into `release`"
+      assert %{status: :done, merged_into: "release"} = Board.get_task!(task.id)
+    end
+
+    test "a merge into another branch on a stopped block comes back to the block",
+         %{bridge: bridge} = context do
+      BridgeStub.queue(bridge, "merger", BridgeStub.merge("blocked", "release"))
+      task = auto_merge!(context)
+      BridgeStub.step(bridge)
+      BridgeStub.step(bridge)
+      started_runs()
+
+      Board.merge_task!(Board.get_task!(task.id), "main")
+      BridgeStub.step(bridge)
+
+      assert [%{"prompt" => prompt}] = started_runs()
+      assert prompt =~ "into `main`"
+
+      task = Board.get_task!(task.id, load: :current_node)
+      assert %{status: :await_human_supervision, stage: nil, merged_into: "main"} = task
+      assert task.current_node.label == "Merge"
+    end
+
+    test "is not offered on another agent block, whose step isn't done", context do
+      task = auto_merge!(context)
+
+      task =
+        task
+        |> Ash.Changeset.for_update(:advance, %{
+          status: :await_human_supervision,
+          stage: nil,
+          worktree_path: "/repos/app/.weworkai/worktrees/x",
+          worktree_branch: "weworkai/x"
+        })
+        |> Ash.update!()
+
+      assert Board.get_task!(task.id, load: :current_node).current_node.label == "Code"
+      refute Engine.mergeable?(task)
+      assert {:error, error} = Board.merge_task(task, "main")
+      assert ErrorText.readable(error) =~ "isn't waiting for a merge"
     end
 
     test "only merger blocks name a branch, and it must be one" do
