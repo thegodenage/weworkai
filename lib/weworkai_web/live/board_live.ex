@@ -62,6 +62,9 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   defp apply_action(socket, :new, _params) do
+    # Fresh, so a workflow deleted since mount is neither offered nor picked from memory.
+    socket = assign(socket, workflows: Workflows.list_workflows!())
+
     assign(socket,
       page_title: "New task",
       form: to_form(Board.form_to_create_task(params: new_task_params(socket.assigns))),

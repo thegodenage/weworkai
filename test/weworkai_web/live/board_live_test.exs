@@ -298,6 +298,27 @@ defmodule WeworkaiWeb.BoardLiveTest do
       assert has_element?(view, "#task-form input[name='form[repository]'][value='~/Projects']")
     end
 
+    test "a remembered workflow deleted while the board is open falls back to the default",
+         %{conn: conn} do
+      lean = Weworkai.Workflows.create_workflow!("Lean")
+      default = Weworkai.Workflows.default_workflow!()
+
+      {:ok, view, _html} =
+        conn
+        |> put_connect_params(%{"task_defaults" => %{"workflow_id" => lean.id}})
+        |> live(~p"/")
+
+      Weworkai.Workflows.destroy_workflow!(lean)
+      render_patch(view, ~p"/tasks/new")
+
+      assert has_element?(
+               view,
+               "#task-form select[name='form[workflow_id]'] option[selected][value='#{default.id}']"
+             )
+
+      refute has_element?(view, "#task-form option[value='#{lean.id}']")
+    end
+
     test "creating a task remembers its repository and workflow for the next one", %{conn: conn} do
       lean = Weworkai.Workflows.create_workflow!("Lean")
       lean_id = lean.id
