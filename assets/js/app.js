@@ -27,10 +27,28 @@ import topbar from "../vendor/topbar"
 import Terminal from "./hooks/terminal"
 import WorkflowEditor from "./workflow_editor"
 
+// The repository and workflow of the last task created, so the next new task starts from
+// them (BoardLive). Sent on every connect; BoardLive pushes fresh ones after each create.
+const TASK_DEFAULTS_KEY = "weworkai:task-defaults"
+
+const taskDefaults = () => {
+  try {
+    return JSON.parse(localStorage.getItem(TASK_DEFAULTS_KEY)) || {}
+  } catch {
+    return {}
+  }
+}
+
+window.addEventListener("phx:remember-task-defaults", ({detail}) => {
+  try {
+    localStorage.setItem(TASK_DEFAULTS_KEY, JSON.stringify(detail))
+  } catch {}
+})
+
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
-  params: {_csrf_token: csrfToken},
+  params: () => ({_csrf_token: csrfToken, task_defaults: taskDefaults()}),
   hooks: {...colocatedHooks, Terminal, WorkflowEditor},
 })
 

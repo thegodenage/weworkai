@@ -28,7 +28,8 @@ defmodule WeworkaiWeb.BoardLive do
         workflows: workflows,
         employees: Organization.list_all_employees!(),
         block_labels: block_labels(workflows),
-        filters: @no_filters
+        filters: @no_filters,
+        remembered: remembered(get_connect_params(socket))
       )
       |> show_tasks()
       |> allow_upload(:attachments,
@@ -63,15 +64,7 @@ defmodule WeworkaiWeb.BoardLive do
   defp apply_action(socket, :new, _params) do
     assign(socket,
       page_title: "New task",
-      form:
-        to_form(
-          Board.form_to_create_task(
-            params: %{
-              "repository" => Task.default_repository(),
-              "workflow_id" => Workflows.default_workflow!().id
-            }
-          )
-        ),
+      form: to_form(Board.form_to_create_task(params: new_task_params(socket.assigns))),
       task: nil,
       details_form: nil,
       continue_targets: [],
@@ -98,6 +91,36 @@ defmodule WeworkaiWeb.BoardLive do
     end
   end
 
+  # The browser remembers the repository and workflow of the last task created
+  # (assets/js/app.js) and sends them on connect; the next new task starts from them.
+  @remembered ["repository", "workflow_id"]
+
+  defp remembered(%{"task_defaults" => %{} = stored}) do
+    for {key, value} when key in @remembered and is_binary(value) and value != "" <- stored,
+        into: %{},
+        do: {key, value}
+  end
+
+  defp remembered(_connect_params), do: %{}
+
+  # A remembered workflow deleted since falls back to the default one.
+  defp new_task_params(%{remembered: remembered, workflows: workflows}) do
+    workflow_id =
+      if Enum.any?(workflows, &(&1.id == remembered["workflow_id"])),
+        do: remembered["workflow_id"],
+        else: Workflows.default_workflow!().id
+
+    %{
+      "repository" => Map.get(remembered, "repository", Task.default_repository()),
+      "workflow_id" => workflow_id
+    }
+  end
+
+  defp remember(socket, task) do
+    remembered = %{"repository" => task.repository, "workflow_id" => task.workflow_id}
+    socket |> assign(remembered: remembered) |> push_event("remember-task-defaults", remembered)
+  end
+
   @impl true
   def handle_event("validate", %{"form" => params}, socket) do
     {:noreply, assign(socket, form: AshPhoenix.Form.validate(socket.assigns.form, params))}
@@ -111,6 +134,7 @@ defmodule WeworkaiWeb.BoardLive do
          |> attach_files(task)
          |> assign(uploads_consumed?: true)
          |> place(task)
+         |> remember(task)
          |> push_patch(to: ~p"/")}
 
       {:error, form} ->

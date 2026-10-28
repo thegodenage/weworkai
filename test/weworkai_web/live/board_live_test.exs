@@ -260,6 +260,74 @@ defmodule WeworkaiWeb.BoardLiveTest do
     assert has_element?(view, "#task-form input[name='form[repository]'][value='~/Projects']")
   end
 
+  describe "remembered repository and workflow" do
+    test "a new task starts from the ones the browser remembers", %{conn: conn} do
+      lean = Weworkai.Workflows.create_workflow!("Lean")
+
+      {:ok, view, _html} =
+        conn
+        |> put_connect_params(%{
+          "task_defaults" => %{"repository" => "~/Projects/app", "workflow_id" => lean.id}
+        })
+        |> live(~p"/tasks/new")
+
+      assert has_element?(
+               view,
+               "#task-form input[name='form[repository]'][value='~/Projects/app']"
+             )
+
+      assert has_element?(
+               view,
+               "#task-form select[name='form[workflow_id]'] option[selected][value='#{lean.id}']"
+             )
+    end
+
+    test "a remembered workflow that no longer exists falls back to the default", %{conn: conn} do
+      default = Weworkai.Workflows.default_workflow!()
+
+      {:ok, view, _html} =
+        conn
+        |> put_connect_params(%{"task_defaults" => %{"workflow_id" => Ash.UUID.generate()}})
+        |> live(~p"/tasks/new")
+
+      assert has_element?(
+               view,
+               "#task-form select[name='form[workflow_id]'] option[selected][value='#{default.id}']"
+             )
+
+      assert has_element?(view, "#task-form input[name='form[repository]'][value='~/Projects']")
+    end
+
+    test "creating a task remembers its repository and workflow for the next one", %{conn: conn} do
+      lean = Weworkai.Workflows.create_workflow!("Lean")
+      lean_id = lean.id
+      {:ok, view, _html} = live(conn, ~p"/tasks/new")
+
+      view
+      |> form("#task-form",
+        form: %{title: "First", repository: "~/Projects/app", workflow_id: lean.id}
+      )
+      |> render_submit()
+
+      assert_push_event(view, "remember-task-defaults", %{
+        "repository" => "~/Projects/app",
+        "workflow_id" => ^lean_id
+      })
+
+      render_patch(view, ~p"/tasks/new")
+
+      assert has_element?(
+               view,
+               "#task-form input[name='form[repository]'][value='~/Projects/app']"
+             )
+
+      assert has_element?(
+               view,
+               "#task-form select[name='form[workflow_id]'] option[selected][value='#{lean.id}']"
+             )
+    end
+  end
+
   defp unconfigured_planner do
     connector =
       Weworkai.Connectors.create_connector!(%{name: "Claude", provider: :claude_code})
