@@ -72,6 +72,8 @@ defmodule Weworkai.MixProject do
       {:mdex, "~> 0.14.2"},
       {:ash_postgres, "~> 2.15"},
       {:ash_phoenix, "~> 2.3"},
+      {:tz, "~> 0.28"},
+      {:crontab, "~> 1.1"},
       {:igniter, "~> 0.8.4", only: [:dev, :test]}
     ]
   end

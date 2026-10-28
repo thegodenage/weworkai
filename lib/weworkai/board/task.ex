@@ -15,6 +15,11 @@ defmodule Weworkai.Board.Task do
 
   def default_repository, do: @default_repository
 
+  # Every task a cron creates carries it (Weworkai.Recurring).
+  @cron_tag "CRON"
+
+  def cron_tag, do: @cron_tag
+
   postgres do
     table "tasks"
     repo Weworkai.Repo
@@ -22,10 +27,14 @@ defmodule Weworkai.Board.Task do
     references do
       reference :assignee, on_delete: :nilify
       reference :parent, on_delete: :nilify
+      reference :cron, on_delete: :nilify
+      reference :group, on_delete: :nilify
     end
 
     custom_indexes do
       index [:parent_id]
+      index [:cron_id]
+      index [:group_id]
     end
   end
 
@@ -37,6 +46,14 @@ defmodule Weworkai.Board.Task do
       argument :pattern, :string, allow_nil?: false
       filter expr(ilike(title, ^arg(:pattern)))
       prepare build(sort: [updated_at: :desc], limit: 20)
+    end
+
+    # A cron's newest run, which its next one may join in a group (Recurring.Runner).
+    read :latest_for_cron do
+      argument :cron_id, :uuid, allow_nil?: false
+      get? true
+      filter expr(cron_id == ^arg(:cron_id))
+      prepare build(sort: [cron_run_at: :desc], limit: 1)
     end
 
     # Jobs are deleted with the task; canceling them first stops a running agent session.
@@ -54,10 +71,22 @@ defmodule Weworkai.Board.Task do
 
                changeset
              end)
+
+      change Changes.DropEmptyGroup
     end
 
     create :create do
-      accept [:title, :description, :repository, :workflow_id]
+      accept [:title, :description, :repository, :workflow_id, :tags]
+      change Changes.DefaultRepository
+      change Changes.DefaultWorkflow
+      change load(:assignee)
+    end
+
+    # A cron's run (Weworkai.Recurring.Runner): tagged CRON, with the slot it ran for and
+    # the group of the runs close to it.
+    create :create_from_cron do
+      accept [:title, :description, :repository, :workflow_id, :cron_id, :cron_run_at, :group_id]
+      change set_attribute(:tags, [@cron_tag])
       change Changes.DefaultRepository
       change Changes.DefaultWorkflow
       change load(:assignee)
@@ -73,10 +102,19 @@ defmodule Weworkai.Board.Task do
     end
 
     update :update do
-      accept [:title, :description, :repository, :workflow_id]
+      accept [:title, :description, :repository, :workflow_id, :tags]
       require_atomic? false
       change Changes.DefaultRepository
       change Changes.SwitchWorkflow
+      change load(:assignee)
+    end
+
+    # Into a group (shown with its other tasks as one stack on the board) or out of one; a
+    # group its last task leaves goes too.
+    update :set_group do
+      accept [:group_id]
+      require_atomic? false
+      change Changes.DropEmptyGroup
       change load(:assignee)
     end
 
@@ -234,6 +272,8 @@ defmodule Weworkai.Board.Task do
 
     publish_all :update, "tasks"
     publish :create_subtask, "tasks"
+    # Nobody's board created it: the card arrives live.
+    publish :create_from_cron, "tasks"
     publish :destroy, "tasks"
   end
 
@@ -253,6 +293,14 @@ defmodule Weworkai.Board.Task do
     end
 
     attribute :description, :string, public?: true
+
+    # Free labels, shown on the card and filtered on; a cron's tasks carry "CRON".
+    attribute :tags, {:array, :string} do
+      allow_nil? false
+      public? true
+      default []
+      constraints max_length: 10, nil_items?: false, items: [max_length: 30]
+    end
 
     attribute :status, Weworkai.Board.Task.Status do
       allow_nil? false
@@ -312,6 +360,9 @@ defmodule Weworkai.Board.Task do
     # USD all the task's runs may spend; nil leaves it uncapped (`Weworkai.Agents.Budget`).
     attribute :budget_usd, :decimal, public?: true, constraints: [greater_than: 0]
 
+    # The slot of the cron that created it (nil: not a cron's); the card shows it.
+    attribute :cron_run_at, :utc_datetime_usec, public?: true
+
     timestamps()
   end
 
@@ -326,6 +377,12 @@ defmodule Weworkai.Board.Task do
     # Set only at creation (`create_subtask`), so sub-tasks form a tree.
     belongs_to :parent, __MODULE__, public?: true
     has_many :children, __MODULE__, destination_attribute: :parent_id, public?: true
+
+    # The cron that created it (Weworkai.Recurring); deleting the cron keeps the task.
+    belongs_to :cron, Weworkai.Recurring.Cron, public?: true
+
+    # Shown with the group's other tasks as one stack per column on the board.
+    belongs_to :group, Weworkai.Board.TaskGroup, public?: true
 
     many_to_many :blockers, __MODULE__,
       through: Weworkai.Board.TaskDependency,

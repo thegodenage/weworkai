@@ -29,6 +29,9 @@ config :ash,
   many_to_many_destroy_destination_on_match?: true,
   known_types: [AshPostgres.Timestamptz, AshPostgres.TimestamptzUsec]
 
+# Crons run on the wall clock of a time zone (Weworkai.Recurring.Runner).
+config :elixir, :time_zone_database, Tz.TimeZoneDatabase
+
 config :spark,
   formatter: [
     remove_parens?: true,
@@ -63,7 +66,8 @@ config :weworkai,
     Weworkai.Connectors,
     Weworkai.Scheduling,
     Weworkai.Notifications,
-    Weworkai.Workflows
+    Weworkai.Workflows,
+    Weworkai.Recurring
   ],
   generators: [timestamp_type: :utc_datetime]
 

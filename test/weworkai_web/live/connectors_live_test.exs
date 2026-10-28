@@ -61,7 +61,9 @@ defmodule WeworkaiWeb.ConnectorsLiveTest do
 
     assert has_element?(view, "#connectors", "Connected")
     assert has_element?(view, "#connectors", "me@weworkai.com")
-    assert [%{method: :local_session, metadata: %{"email" => "me@weworkai.com"}}] = Ash.read!(Auth)
+
+    assert [%{method: :local_session, metadata: %{"email" => "me@weworkai.com"}}] =
+             Ash.read!(Auth)
 
     # Reconnecting replaces the metadata instead of adding a second row.
     view |> element("a[aria-label='Connect Claude']") |> render_click()

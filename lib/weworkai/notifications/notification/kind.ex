@@ -14,6 +14,7 @@ defmodule Weworkai.Notifications.Notification.Kind do
       workflow_stuck: [description: "The task's workflow has no way on from where it is"],
       budget_warning: [description: "A task or an agent spent 80% of its budget"],
       budget_reached: [description: "A task or an agent spent its budget; no new run starts"],
-      unblocked: [description: "The task's last open blocker closed; its agents may start"]
+      unblocked: [description: "The task's last open blocker closed; its agents may start"],
+      cron_failed: [description: "A cron's task could not start its workflow"]
     ]
 end
