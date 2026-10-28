@@ -430,6 +430,10 @@ defmodule WeworkaiWeb.BoardLive do
 
   defp uploading?(upload), do: Enum.any?(upload.entries, &(not &1.done?))
 
+  # Lets the description's preview show the attachments it references by name.
+  defp attachment_urls(attachments),
+    do: Map.new(attachments, &{&1.name, ~p"/attachments/#{&1.id}"})
+
   defp file_size(bytes) when bytes < 1_000, do: "#{bytes} B"
   defp file_size(bytes) when bytes < 1_000_000, do: "#{div(bytes, 1_000)} KB"
   defp file_size(bytes), do: "#{Float.round(bytes / 1_000_000, 1)} MB"
@@ -897,7 +901,9 @@ defmodule WeworkaiWeb.BoardLive do
             <.markdown_editor
               id="task-drawer-description"
               field={@details_form[:description]}
-              placeholder="Add a description…"
+              upload={@uploads.attachments}
+              files={attachment_urls(@attachments)}
+              placeholder="Add a description… Paste a screenshot to attach it."
               rows="12"
               phx-debounce="800"
             />
@@ -968,8 +974,9 @@ defmodule WeworkaiWeb.BoardLive do
           <.markdown_editor
             id="task-form-description"
             field={@form[:description]}
+            upload={@uploads.attachments}
             label="Description"
-            placeholder="Add a description…"
+            placeholder="Add a description… Paste a screenshot to attach it."
             rows="6"
           />
           <div class="fieldset mb-2">
@@ -1018,7 +1025,9 @@ defmodule WeworkaiWeb.BoardLive do
       class="flex cursor-pointer items-center justify-center gap-2 rounded-md border border-dashed border-(--orpheus-border) px-3 py-4 text-sm text-(--orpheus-text-muted) transition-colors hover:border-primary/60 hover:text-base-content phx-drop-target-active:border-primary phx-drop-target-active:bg-primary/5"
     >
       <.icon name="hero-arrow-up-tray-micro" class="size-4" />
-      <span>Drop files or <span class="text-primary">browse</span></span>
+      <span>
+        Drop files, paste into the description, or <span class="text-primary">browse</span>
+      </span>
       <.live_file_input upload={@upload} class="sr-only" />
     </label>
     <p :for={error <- upload_errors(@upload)} class="mt-1 text-xs text-error">

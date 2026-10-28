@@ -588,18 +588,29 @@ defmodule WeworkaiWeb.CoreComponents do
 
   @doc """
   Renders markdown as sanitized HTML.
+
+  `files` maps attached file names to their URLs, so `![shot.png](shot.png)` shows the attachment.
   """
   attr :content, :string, default: nil
   attr :class, :any, default: nil
+  attr :files, :map, default: %{}
 
   def markdown(assigns) do
     ~H"""
     <div class={["markdown", @class]}>
       {Phoenix.HTML.raw(
-        MDEx.to_html!(@content || "", sanitize: MDEx.Document.default_sanitize_options())
+        MDEx.to_html!(link_files(@content || "", @files),
+          sanitize: MDEx.Document.default_sanitize_options()
+        )
       )}
     </div>
     """
+  end
+
+  defp link_files(content, files) do
+    Enum.reduce(files, content, fn {name, url}, content ->
+      String.replace(content, "](#{name})", "](#{url})")
+    end)
   end
 
   @markdown_tools [
@@ -615,17 +626,28 @@ defmodule WeworkaiWeb.CoreComponents do
   @doc """
   Renders a markdown textarea with a formatting toolbar and a Write/Preview switch.
   The preview renders `field.value` server-side, so it is as fresh as the form's last phx-change.
+
+  With an `upload`, images pasted into the textarea (a screenshot on ⌘V) go to that upload, and
+  a `![name](name)` reference to each goes in at the cursor. `files` (see `markdown/1`) lets the
+  preview show the ones already attached.
   """
   attr :id, :string, required: true
   attr :field, Phoenix.HTML.FormField, required: true
   attr :label, :string, default: nil
+  attr :upload, Phoenix.LiveView.UploadConfig, default: nil
+  attr :files, :map, default: %{}
   attr :rest, :global, include: ~w(placeholder rows phx-debounce)
 
   def markdown_editor(assigns) do
     assigns = assign(assigns, :tools, @markdown_tools)
 
     ~H"""
-    <div id={@id} class="fieldset mb-2" phx-hook=".MarkdownEditor">
+    <div
+      id={@id}
+      class="fieldset mb-2"
+      phx-hook=".MarkdownEditor"
+      data-upload={@upload && @upload.name}
+    >
       <span :if={@label} class="label mb-1">{@label}</span>
       <div class="rounded-md border border-(--orpheus-border) bg-base-200 focus-within:border-primary">
         <div class="flex items-center gap-1 border-b border-(--orpheus-border) px-1 py-1">
@@ -666,7 +688,7 @@ defmodule WeworkaiWeb.CoreComponents do
           {@rest}
         >{Phoenix.HTML.Form.normalize_value("textarea", @field.value)}</textarea>
         <div id={"#{@id}-preview"} class="hidden min-h-24 px-3 py-2 text-sm">
-          <.markdown :if={@field.value not in [nil, ""]} content={@field.value} />
+          <.markdown :if={@field.value not in [nil, ""]} content={@field.value} files={@files} />
           <p :if={@field.value in [nil, ""]} class="text-(--orpheus-text-muted)">
             Nothing to preview
           </p>
@@ -676,10 +698,11 @@ defmodule WeworkaiWeb.CoreComponents do
     <script :type={Phoenix.LiveView.ColocatedHook} name=".MarkdownEditor">
       export default {
         mounted() {
+          const textarea = this.el.querySelector("textarea")
+
           this.el.addEventListener("click", (event) => {
             const button = event.target.closest("[data-before]")
             if (!button) return
-            const textarea = this.el.querySelector("textarea")
             const {selectionStart: start, selectionEnd: end, value} = textarea
             const {before, after} = button.dataset
             textarea.value = value.slice(0, start) + before + value.slice(start, end) + after + value.slice(end)
@@ -688,6 +711,32 @@ defmodule WeworkaiWeb.CoreComponents do
             // Programmatic edits don't fire input; LiveView needs it to see the change.
             textarea.dispatchEvent(new Event("input", {bubbles: true}))
           })
+
+          textarea.addEventListener("paste", (event) => {
+            const upload = this.el.dataset.upload
+            const clipboard = event.clipboardData
+            if (!upload || !clipboard || clipboard.types.includes("text/plain")) return
+            const images = Array.from(clipboard.files).filter((file) => file.type.startsWith("image/"))
+            if (images.length === 0) return
+            event.preventDefault()
+            // Every screenshot pastes as "image.png", and a task keeps one file per name.
+            const stamp = new Date().toISOString().slice(0, 23).replace("T", "-").replace(/:/g, "").replace(".", "-")
+            const named = images.map((file, i) => {
+              const ext = file.name.match(/\.[A-Za-z0-9]+$/)?.[0] ?? ""
+              const index = images.length > 1 ? `-${i + 1}` : ""
+              return new File([file], `screenshot-${stamp}${index}${ext}`, {type: file.type})
+            })
+            this.upload(upload, named)
+            this.replaceSelection(textarea, named.map(({name}) => `![${name}](${name})`).join("\n"))
+          })
+        },
+
+        replaceSelection(textarea, text) {
+          const {selectionStart: start, selectionEnd: end, value} = textarea
+          textarea.value = value.slice(0, start) + text + value.slice(end)
+          textarea.setSelectionRange(start + text.length, start + text.length)
+          // Programmatic edits don't fire input; LiveView needs it to see the change.
+          textarea.dispatchEvent(new Event("input", {bubbles: true}))
         },
       }
     </script>

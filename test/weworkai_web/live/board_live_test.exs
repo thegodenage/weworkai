@@ -402,6 +402,36 @@ defmodule WeworkaiWeb.BoardLiveTest do
     assert [%{name: "spec.md", size: 6}] = Board.list_attachments!(task.id)
   end
 
+  test "both description editors take pasted screenshots as attachments", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    assert has_element?(view, "#task-form-description[data-upload='attachments']")
+
+    task = Board.create_task!(%{title: "Pasted"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+    assert has_element?(view, "#task-drawer-description[data-upload='attachments']")
+  end
+
+  test "the drawer previews a pasted screenshot's reference as the attachment", %{conn: conn} do
+    task = Board.create_task!(%{title: "With a screenshot"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+    name = "screenshot-2026-10-28-143005-123.png"
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: "png", type: "image/png"}
+    ])
+    |> render_upload(name)
+
+    view
+    |> form("#task-drawer-description-form",
+      form: %{description: "Broken:\n\n![#{name}](#{name})"}
+    )
+    |> render_change()
+
+    assert [%{id: id}] = Board.list_attachments!(task.id)
+    assert has_element?(view, "#task-drawer-description-preview img[src='/attachments/#{id}']")
+  end
+
   test "the drawer attaches a file once uploaded, shows it and removes it", %{conn: conn} do
     task = Board.create_task!(%{title: "Needs a mockup"})
     {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
