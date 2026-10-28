@@ -56,5 +56,11 @@ defmodule WeworkaiWeb.BoardTagsLiveTest do
 
     drawer |> form("#task-drawer-tags-form", form: %{tags: "CRON, gitlab"}) |> render_change()
     assert Board.get_task!(task.id).tags == ["CRON", "gitlab"]
+    refute has_element?(drawer, "#task-drawer-tags-error")
+
+    too_many = Enum.map_join(0..10, ", ", &"t#{&1}")
+    drawer |> form("#task-drawer-tags-form", form: %{tags: too_many}) |> render_change()
+    assert has_element?(drawer, "#task-drawer-tags-error")
+    assert Board.get_task!(task.id).tags == ["CRON", "gitlab"]
   end
 end

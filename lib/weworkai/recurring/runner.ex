@@ -81,14 +81,28 @@ defmodule Weworkai.Recurring.Runner do
     end
   end
 
+  # Five fields, however far apart; a sixth would be read as a year (`0 0 9 * * *` is not
+  # 9:00 daily but midnight on the 9th), so it is refused, as is `@reboot`, which parses
+  # but has no dates.
   defp parse(expression) do
-    case Parser.parse(String.trim(expression)) do
-      # It parses, but has no dates: the scheduler raises on it.
-      {:ok, %{reboot: true}} -> {:error, "@reboot is not supported"}
-      {:ok, parsed} -> {:ok, parsed}
-      {:error, _message} -> {:error, "is not a valid cron expression"}
+    fields = String.split(expression)
+
+    case Parser.parse(Enum.join(fields, " ")) do
+      {:ok, %{reboot: true}} ->
+        {:error, "@reboot is not supported"}
+
+      {:ok, parsed} ->
+        if special?(fields) or length(fields) == 5,
+          do: {:ok, parsed},
+          else: {:error, "needs five fields: minute hour day-of-month month weekday"}
+
+      {:error, _message} ->
+        {:error, "is not a valid cron expression"}
     end
   end
+
+  defp special?([<<"@", _rest::binary>>]), do: true
+  defp special?(_fields), do: false
 
   @doc "`:ok` for an expression a cron may run on: it parses and matches some date; else why not."
   @spec check_expression(String.t()) :: :ok | {:error, String.t()}
@@ -122,13 +136,15 @@ defmodule Weworkai.Recurring.Runner do
 
   def preview(_expression, _timezone, _count), do: {:error, :blank}
 
-  @doc "Fires (or skips, when too late) every cron due as of `now`; one that raises leaves the others be."
+  @doc """
+  Fires every cron due as of `now`, for its newest slot that has come, if that is within
+  the grace window; older slots are skipped, the first of them recorded. One that raises
+  leaves the others be.
+  """
   def start_due(now \\ DateTime.utc_now()) do
     Enum.each(Recurring.due_crons!(now), fn cron ->
       try do
-        if DateTime.diff(now, cron.next_run_at, :minute) > @grace_minutes,
-          do: skip!(cron, now),
-          else: start(cron, now, cron.next_run_at)
+        catch_up(cron, now)
       rescue
         error ->
           Logger.error(
@@ -139,25 +155,37 @@ defmodule Weworkai.Recurring.Runner do
     end)
   end
 
-  # The next slot is the newest within the grace window: when one has come already (a cron
-  # running several times a day, back after an outage), the next tick fires it, once; the
-  # older ones in the window are skipped too.
-  defp skip!(cron, now) do
-    Recurring.claim_cron!(cron, %{
-      next_run_at:
-        newest_slot(cron, next_slot(cron, DateTime.add(now, -@grace_minutes, :minute)), now),
-      last_skipped_at: cron.next_run_at
-    })
+  defp catch_up(cron, now) do
+    missed = cron.next_run_at
+    window = DateTime.add(now, -@grace_minutes, :minute)
+
+    # Its first slot within the window; walking from a slot older than that could take
+    # long (a minutely cron down for days).
+    first =
+      if DateTime.compare(missed, window) == :lt,
+        do: next_run(cron, DateTime.add(window, -1, :second)),
+        else: missed
+
+    case first && DateTime.compare(first, now) != :gt && newest_slot(cron, first, now) do
+      %DateTime{} = slot when slot == missed ->
+        start(cron, now, slot)
+
+      %DateTime{} = slot ->
+        fire(cron, now, slot, %{last_skipped_at: missed})
+
+      _none_come ->
+        Recurring.claim_cron!(cron, %{next_run_at: first, last_skipped_at: missed})
+    end
   end
 
-  # The last slot from `slot` on that has come by `now`; `slot` itself when it is still ahead.
+  # The last slot from `slot` on that has come by `now`.
   defp newest_slot(cron, slot, now) do
-    with %DateTime{} <- slot,
-         %DateTime{} = next <- next_slot(cron, slot),
-         true <- DateTime.compare(next, now) != :gt do
-      newest_slot(cron, next, now)
-    else
-      _ahead -> slot
+    case next_run(cron, slot) do
+      %DateTime{} = next ->
+        if DateTime.compare(next, now) == :gt, do: slot, else: newest_slot(cron, next, now)
+
+      nil ->
+        slot
     end
   end
 
@@ -169,19 +197,17 @@ defmodule Weworkai.Recurring.Runner do
   """
   @spec start(Weworkai.Recurring.Cron.t(), DateTime.t(), DateTime.t() | nil) ::
           {:ok, Weworkai.Board.Task.t()} | {:error, String.t()}
-  def start(cron, now \\ DateTime.utc_now(), slot \\ nil) do
-    slot = slot || now
+  def start(cron, now \\ DateTime.utc_now(), slot \\ nil),
+    do: fire(cron, now, slot || now, missed_seen(cron))
 
+  defp fire(cron, now, slot, claim) do
     cron =
       Recurring.claim_cron!(
         cron,
-        Map.merge(
-          %{last_run_at: now, next_run_at: next_slot(cron, now)},
-          missed_seen(cron)
-        )
+        Map.merge(%{last_run_at: now, next_run_at: next_slot(cron, now)}, claim)
       )
 
-    with {:ok, task} <- create_task(cron, slot, group_id(cron, slot)) do
+    with {:ok, task} <- create_task(cron, slot) do
       case Board.move_task(task, :todo) do
         {:ok, started} ->
           Recurring.record_cron_run!(cron, %{last_error: nil})
@@ -209,19 +235,21 @@ defmodule Weworkai.Recurring.Runner do
 
   # Runs close together (at most `group_gap_minutes/0` apart, on the same day of the
   # cron's clock) share the cron's group: a half-hourly cron leaves one stack a day, not
-  # twenty cards. A run a person moved into a group of their own starts none.
-  defp group_id(cron, slot) do
+  # twenty cards. A run a person put in a group of their own, or took out of one (`apart`),
+  # starts none, and the day's runs after it stay apart too.
+  defp grouping(cron, slot) do
     cron_id = cron.id
 
     with {:ok, %{} = previous} <- Board.latest_cron_task(cron.id, load: :group),
          true <- close?(cron, previous.cron_run_at, slot) do
       case previous.group do
-        nil -> start_group!(cron, previous).id
-        %{cron_id: ^cron_id, id: id} -> id
-        _theirs -> nil
+        nil when previous.apart -> :apart
+        nil -> {:start, previous}
+        %{cron_id: ^cron_id, id: id} -> {:join, id}
+        _theirs -> :none
       end
     else
-      _apart -> nil
+      _far -> :none
     end
   end
 
@@ -233,8 +261,33 @@ defmodule Weworkai.Recurring.Runner do
   defp local_date(moment, cron),
     do: moment |> DateTime.shift_zone!(cron.timezone) |> DateTime.to_date()
 
-  # The second close run: a group named for the cron and the day, the first run in it.
-  defp start_group!(cron, previous) do
+  # The group is started only once the new run exists, so a run that fails to be created
+  # leaves the one before it as it was.
+  defp create_task(cron, slot) do
+    grouping = grouping(cron, slot)
+
+    attrs = %{
+      title: "#{cron.name} · #{run_date(cron, slot)}",
+      description: cron.description,
+      repository: cron.repository,
+      workflow_id: cron.workflow_id,
+      cron_id: cron.id,
+      cron_run_at: slot,
+      cron_timezone: cron.timezone,
+      group_id: with({:join, id} <- grouping, do: id, else: (_ -> nil)),
+      apart: grouping == :apart
+    }
+
+    with {:ok, task} <- Board.create_cron_task(attrs) do
+      case grouping do
+        {:start, previous} -> start_group(cron, previous, task)
+        _other -> {:ok, task}
+      end
+    end
+  end
+
+  # The second close run: a group named for the cron and the day, both runs in it.
+  defp start_group(cron, previous, task) do
     day =
       previous.cron_run_at
       |> DateTime.shift_zone!(cron.timezone)
@@ -242,19 +295,7 @@ defmodule Weworkai.Recurring.Runner do
 
     group = Board.create_cron_task_group!(%{name: "#{cron.name} · #{day}", cron_id: cron.id})
     Board.group_task!(previous, group.id)
-    group
-  end
-
-  defp create_task(cron, slot, group_id) do
-    Board.create_cron_task(%{
-      title: "#{cron.name} · #{run_date(cron, slot)}",
-      description: cron.description,
-      repository: cron.repository,
-      workflow_id: cron.workflow_id,
-      cron_id: cron.id,
-      cron_run_at: slot,
-      group_id: group_id
-    })
+    Board.group_task(task, group.id)
   end
 
   # The slot on the cron's own clock: its day, and the time too when it runs on an

@@ -16,7 +16,7 @@ defmodule Weworkai.Workflows.Workflow.Validations.Unused do
         {:error, message: "#{tasks(workflow.task_count)} still use this workflow"}
 
       workflow.cron_count > 0 ->
-        {:error, message: "#{crons(workflow.cron_count)} still run this workflow"}
+        {:error, message: crons(workflow.cron_count)}
 
       Ash.count!(Workflow) == 1 ->
         {:error, message: "the last workflow can't be deleted"}
@@ -29,6 +29,6 @@ defmodule Weworkai.Workflows.Workflow.Validations.Unused do
   defp tasks(1), do: "1 task"
   defp tasks(count), do: "#{count} tasks"
 
-  defp crons(1), do: "1 cron"
-  defp crons(count), do: "#{count} crons"
+  defp crons(1), do: "1 cron still runs this workflow"
+  defp crons(count), do: "#{count} crons still run this workflow"
 end

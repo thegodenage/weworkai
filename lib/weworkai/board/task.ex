@@ -85,7 +85,18 @@ defmodule Weworkai.Board.Task do
     # A cron's run (Weworkai.Recurring.Runner): tagged CRON, with the slot it ran for and
     # the group of the runs close to it.
     create :create_from_cron do
-      accept [:title, :description, :repository, :workflow_id, :cron_id, :cron_run_at, :group_id]
+      accept [
+        :title,
+        :description,
+        :repository,
+        :workflow_id,
+        :cron_id,
+        :cron_run_at,
+        :cron_timezone,
+        :group_id,
+        :apart
+      ]
+
       change set_attribute(:tags, [@cron_tag])
       change Changes.DefaultRepository
       change Changes.DefaultWorkflow
@@ -114,6 +125,13 @@ defmodule Weworkai.Board.Task do
     update :set_group do
       accept [:group_id]
       require_atomic? false
+
+      # Taken out of a group (or kept out of one) by a person: a cron doesn't group it again.
+      change fn changeset, _context ->
+        apart? = is_nil(Ash.Changeset.get_attribute(changeset, :group_id))
+        Ash.Changeset.force_change_attribute(changeset, :apart, apart?)
+      end
+
       change Changes.DropEmptyGroup
       change load(:assignee)
     end
@@ -362,6 +380,12 @@ defmodule Weworkai.Board.Task do
 
     # The slot of the cron that created it (nil: not a cron's); the card shows it.
     attribute :cron_run_at, :utc_datetime_usec, public?: true
+    # The cron's time zone then, so the slot reads the same once the cron is gone.
+    attribute :cron_timezone, :string, public?: true, constraints: [max_length: 100]
+
+    # A person took it out of its group: the cron that made it doesn't group it, nor the
+    # day's runs after it.
+    attribute :apart, :boolean, allow_nil?: false, public?: true, default: false
 
     timestamps()
   end

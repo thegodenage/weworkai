@@ -10,7 +10,8 @@ defmodule Weworkai.Recurring.Cron do
   use Ash.Resource,
     otp_app: :weworkai,
     domain: Weworkai.Recurring,
-    data_layer: AshPostgres.DataLayer
+    data_layer: AshPostgres.DataLayer,
+    notifiers: [Ash.Notifier.PubSub]
 
   alias Weworkai.Board.Task
   alias Weworkai.Recurring.Cron.{Changes, Validations}
@@ -81,6 +82,17 @@ defmodule Weworkai.Recurring.Cron do
     update :record_run do
       accept [:last_error]
     end
+  end
+
+  # Fires and edits land on the Recurring tab live.
+  pub_sub do
+    module Phoenix.PubSub
+    name Weworkai.PubSub
+    transform fn _notification -> :cron_changed end
+
+    publish_all :create, "crons"
+    publish_all :update, "crons"
+    publish_all :destroy, "crons"
   end
 
   attributes do

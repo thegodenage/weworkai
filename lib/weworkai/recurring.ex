@@ -20,12 +20,21 @@ defmodule Weworkai.Recurring do
     end
   end
 
-  @doc "A moment on a cron's own clock: \"Wed 28 Oct, 09:00\"."
+  @doc """
+  A moment on a cron's own clock: "Wed 28 Oct, 09:00", with the year when it isn't this
+  one ("Mon 29 Feb 2044, 00:00").
+  """
   def local_time(nil, _timezone), do: "—"
 
   def local_time(datetime, timezone) do
-    datetime
-    |> DateTime.shift_zone!(timezone || "Etc/UTC")
-    |> Calendar.strftime("%a %d %b, %H:%M")
+    timezone = timezone || "Etc/UTC"
+    local = DateTime.shift_zone!(datetime, timezone)
+
+    format =
+      if local.year == DateTime.now!(timezone).year,
+        do: "%a %d %b, %H:%M",
+        else: "%a %d %b %Y, %H:%M"
+
+    Calendar.strftime(local, format)
   end
 end

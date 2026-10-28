@@ -102,6 +102,29 @@ defmodule WeworkaiWeb.RecurringLiveTest do
     assert has_element?(view, "#cron-#{cron.id}-skipped")
   end
 
+  test "a cron fired or deleted elsewhere shows so", %{conn: conn} do
+    cron =
+      Recurring.create_cron!(%{
+        name: "Hourly",
+        workflow_id: Workflows.default_workflow!().id,
+        mode: :expression,
+        expression: "0 * * * *"
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/recurring")
+    assert has_element?(view, "#cron-#{cron.id}-tasks", "0 tasks")
+
+    :ok = Weworkai.Recurring.Runner.start_due(DateTime.add(cron.next_run_at, 1, :minute))
+    assert has_element?(view, "#cron-#{cron.id}-tasks", "1 task")
+    assert has_element?(view, "#cron-#{cron.id}-last-task")
+
+    # Its row is still here when the person clicks; the cron isn't.
+    stale = element(view, "#cron-#{cron.id}-run")
+    Weworkai.Repo.query!("DELETE FROM crons WHERE id = $1", [Ecto.UUID.dump!(cron.id)])
+    render_click(stale)
+    assert render(view) =~ "Cron not found."
+  end
+
   test "@reboot is refused, not crashed on", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/recurring/new")
     view |> form("#cron-form", form: %{mode: "expression"}) |> render_change()

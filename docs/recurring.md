@@ -10,9 +10,11 @@ interactions, every half hour during the day to check for comments on posts. The
   (`timezone`, the browser's to start with; DST is followed, with the `tz` database):
   - `weekly` ("Days & time"): ISO weekdays (`days`, 1 = Monday) at a time of day (`at`);
   - `expression` ("Cron expression"): five fields, minute hour day-of-month month weekday
-    (`0 9 * * 1-5`, `*/30 8-18 * * *`, `@hourly`), parsed by `crontab`. Any that parses and
-    ever matches is accepted, however often it runs (runs close together are grouped);
-    the form previews its next three runs;
+    (`0 9 * * 1-5`, `*/30 8-18 * * *`, `@hourly`), parsed by `crontab`, any spaces between
+    them. Any that parses and ever matches is accepted, however often it runs (runs close
+    together are grouped); a sixth field (crontab would read it as a year, not seconds)
+    and `@reboot` are refused. The form previews its next three runs, with the year when
+    it isn't this one;
 - the **task** it creates: `name` (the title, with the slot's day, and its time too for an
   expression: "Daily GitLab digest · Wed 28 Oct", "Inbox · Wed 28 Oct 14:30"),
   `description` (what the agents are to do) and `repository`.
@@ -30,15 +32,19 @@ Code: `lib/weworkai/recurring/` (Ash domain `Weworkai.Recurring`; `Cron`, `Runne
   (`Task.create_from_cron`) and **moved to todo**, exactly as a person moving it would: the
   workflow's version, problems and refusals apply. Every run creates its own task, whether
   or not the last one is still open.
-- **Grace window**: a slot fires up to 60 minutes late (`Runner.grace_minutes/0`). One
-  missed by more (the app wasn't running) is skipped: no task, `last_skipped_at` records it,
-  and the next slot is the first within the window, so after a long outage the newest slot
-  still within it fires once (an hourly cron down for three hours: the last hour fires).
-  The Recurring tab shows the missed slot until the run after that catch-up clears it.
-  `@reboot` parses but has no dates, so it is refused.
+- **Grace window**: a slot fires up to 60 minutes late (`Runner.grace_minutes/0`). When
+  several slots have come since the cron last fired (the app wasn't running), only the
+  newest one within the window fires, once; the older ones are skipped, the first of them
+  recorded in `last_skipped_at` (an hourly cron down for three hours: the last hour
+  fires; a half-hourly one down 50 minutes: the later slot fires, the earlier is missed).
+  With none within the window, no task is made. The Recurring tab shows the missed slot
+  until the run after the catch-up clears it, and follows fires and edits live
+  (`"crons"` topic).
 - A task that can't start stays in backlog; the cron shows why (`last_error`) and a
   `cron_failed` notification goes out. **Run now** fires a cron at once, its slot being now.
-- Deleting a cron keeps its tasks and groups (their `cron_id` is nilified).
+- Deleting a cron keeps its tasks and groups (their `cron_id` is nilified). A task keeps
+  its cron's time zone (`tasks.cron_timezone`), so its scheduled time reads the same, and
+  a stack of cron runs keeps its CRON chip and time span.
 
 ## Tags and the CRON tag
 
@@ -62,7 +68,9 @@ puts them all back. A group goes when its last task leaves it (`DropEmptyGroup`)
   run's group when it comes at most 60 minutes after it on the same day of the cron's
   clock (`Runner.group_gap_minutes/0`), so a half-hourly cron leaves one stack a day. The
   second close run creates the group ("Inbox · Wed 28 Oct", `cron_id` set) and moves the
-  first into it. A run a person moved into a group of their own starts none.
+  first into it, once the second exists. A run a person moved into a group of their own
+  starts none; one a person took out of a group (Ungroup, or "No group": `tasks.apart`)
+  starts none either, and the day's runs after it stay apart too.
 - **Any tasks** can be grouped from the board drawer's Group control: an existing group,
   or "New group…" with a name; "No group" takes a task out.
 - **Dragging a whole stack** to another column moves every task of the group in the

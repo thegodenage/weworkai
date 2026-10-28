@@ -157,6 +157,9 @@ defmodule WeworkaiWeb.BoardLive do
       |> Map.values()
       |> Enum.filter(&(to_string(&1.status) == from))
 
+    # One flash for this move: the last one's no longer applies.
+    socket = clear_flash(socket)
+
     {socket, refused} =
       Enum.reduce(tasks, {socket, []}, fn task, {socket, refused} ->
         with {:ok, task} <- Board.get_task(task.id),
@@ -171,7 +174,7 @@ defmodule WeworkaiWeb.BoardLive do
 
     case refused do
       [] ->
-        {:noreply, put_flash(socket, :info, "Moved #{length(tasks)} tasks.")}
+        {:noreply, put_flash(socket, :info, "Moved #{count_of(length(tasks), "task")}.")}
 
       [reason | _] ->
         moved = length(tasks) - length(refused)
@@ -530,6 +533,9 @@ defmodule WeworkaiWeb.BoardLive do
 
   defp tag_params(params), do: params
 
+  defp count_of(1, noun), do: "1 #{noun}"
+  defp count_of(number, noun), do: "#{number} #{noun}s"
+
   defp tags_text(tags) when is_list(tags), do: Enum.join(tags, ", ")
   defp tags_text(text), do: text || ""
 
@@ -885,7 +891,7 @@ defmodule WeworkaiWeb.BoardLive do
                     :if={task.cron_run_at}
                     id={"task-#{task.id}-cron-time"}
                     at={task.cron_run_at}
-                    timezone={task.cron && task.cron.timezone}
+                    timezone={task.cron_timezone}
                   />
                 </div>
                 <p
@@ -965,7 +971,8 @@ defmodule WeworkaiWeb.BoardLive do
               if (group) {
                 const {count, name} = this.dragged.dataset
                 const to = column.getAttribute("aria-label")
-                if (!window.confirm(`Move all ${count} tasks of “${name}” to ${to}?`)) return
+                const tasks = count === "1" ? "the 1 task" : `all ${count} tasks`
+                if (!window.confirm(`Move ${tasks} of “${name}” to ${to}?`)) return
                 this.pushEvent("move_group", {
                   group_id: group,
                   from: source.dataset.status,
@@ -1187,11 +1194,18 @@ defmodule WeworkaiWeb.BoardLive do
                   phx-debounce="blur"
                   class="input input-sm w-56"
                 />
+                <p
+                  :for={message <- Enum.map(@details_form[:tags].errors, &translate_error/1)}
+                  id="task-drawer-tags-error"
+                  class="mt-1 text-xs text-error"
+                >
+                  Tags {message}; not saved.
+                </p>
               </.form>
             </dd>
             <dt :if={@task.cron_run_at} class="micro-label">Scheduled</dt>
             <dd :if={@task.cron_run_at} id="task-drawer-cron" class="flex items-center gap-2">
-              <.cron_time at={@task.cron_run_at} timezone={@task.cron && @task.cron.timezone} />
+              <.cron_time at={@task.cron_run_at} timezone={@task.cron_timezone} />
               <.link
                 :if={@task.cron}
                 navigate={~p"/recurring"}
@@ -1384,6 +1398,7 @@ defmodule WeworkaiWeb.BoardLive do
       assign(assigns,
         group: assigns.stack.group,
         tasks: assigns.stack.tasks,
+        cron?: cron_stack?(assigns.stack),
         span: span(assigns.stack)
       )
 
@@ -1398,7 +1413,7 @@ defmodule WeworkaiWeb.BoardLive do
       data-name={@group.name}
       class={[
         "board-stack orpheus-card group/stack cursor-grab text-xs active:cursor-grabbing",
-        @group.cron_id && "board-stack-cron"
+        @cron? && "board-stack-cron"
       ]}
     >
       <button
@@ -1415,7 +1430,7 @@ defmodule WeworkaiWeb.BoardLive do
             <span id={"#{@id}-count"} class="orpheus-badge tone-violet tabular-nums">
               ×{length(@tasks)}
             </span>
-            <.task_tag :if={@group.cron_id} tag={Task.cron_tag()} />
+            <.task_tag :if={@cron?} tag={Task.cron_tag()} />
             <span
               :if={@span}
               id={"#{@id}-span"}
@@ -1455,7 +1470,7 @@ defmodule WeworkaiWeb.BoardLive do
             <.cron_time
               :if={task.cron_run_at}
               at={task.cron_run_at}
-              timezone={task.cron && task.cron.timezone}
+              timezone={task.cron_timezone}
             />
           </.link>
         </li>
@@ -1476,11 +1491,17 @@ defmodule WeworkaiWeb.BoardLive do
     """
   end
 
-  # A cron group's first and last run time on its clock: "08:00–14:30".
-  defp span(%{group: %{cron_id: nil}}), do: nil
+  # A cron's group, or one of cron runs only (its cron may be gone).
+  defp cron_stack?(%{group: %{cron_id: cron_id}, tasks: tasks}),
+    do: not is_nil(cron_id) or Enum.all?(tasks, & &1.cron_run_at)
 
-  defp span(%{tasks: tasks}) do
-    timezone = Enum.find_value(tasks, &(&1.cron && &1.cron.timezone)) || "Etc/UTC"
+  # A cron group's first and last run time on its clock: "08:00–14:30".
+  defp span(stack) do
+    if cron_stack?(stack), do: run_span(stack.tasks)
+  end
+
+  defp run_span(tasks) do
+    timezone = Enum.find_value(tasks, & &1.cron_timezone) || "Etc/UTC"
     clock = &(&1 |> DateTime.shift_zone!(timezone) |> Calendar.strftime("%H:%M"))
 
     case tasks |> Enum.map(& &1.cron_run_at) |> Enum.reject(&is_nil/1) do

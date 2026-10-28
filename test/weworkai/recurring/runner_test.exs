@@ -61,6 +61,12 @@ defmodule Weworkai.Recurring.RunnerTest do
 
       assert Runner.check_expression("0 0 30 2 *") == {:error, "never runs"}
       assert Runner.check_expression("@reboot") == {:error, "@reboot is not supported"}
+      assert Runner.check_expression("0  9 * *   1-5") == :ok
+      assert Runner.check_expression("@daily") == :ok
+
+      assert Runner.check_expression("0 0 9 * * *") ==
+               {:error, "needs five fields: minute hour day-of-month month weekday"}
+
       assert Runner.preview("@reboot", "Etc/UTC") == {:error, "@reboot is not supported"}
     end
   end
@@ -167,6 +173,19 @@ defmodule Weworkai.Recurring.RunnerTest do
     assert task.title == "Check comments · Mon 02 Nov 11:10"
   end
 
+  test "a short outage fires the newest slot that came, and records the older one" do
+    cron = cron!(human_workflow!(), %{mode: :expression, expression: "*/30 * * * *"})
+    due_at!(cron, ~U[2026-11-02 08:00:00Z])
+
+    :ok = Runner.start_due(~U[2026-11-02 08:50:00Z])
+
+    [task] = Board.list_tasks!()
+    assert task.cron_run_at == ~U[2026-11-02 08:30:00.000000Z]
+    cron = Recurring.get_cron!(cron.id)
+    assert cron.last_skipped_at == ~U[2026-11-02 08:00:00.000000Z]
+    assert cron.next_run_at == ~U[2026-11-02 09:00:00.000000Z]
+  end
+
   test "a missed slot stays recorded through the catch-up run, and clears at the next" do
     cron = cron!(human_workflow!(), %{mode: :expression, expression: "0 * * * *"})
     due_at!(cron, ~U[2026-11-02 08:00:00Z])
@@ -192,6 +211,49 @@ defmodule Weworkai.Recurring.RunnerTest do
     assert first.group_id == second.group_id
     assert %{name: "Check comments · Mon 02 Nov", cron_id: cron_id} = second.group
     assert cron_id == cron.id
+  end
+
+  test "runs a person ungrouped stay apart for the rest of the day" do
+    cron = cron!(human_workflow!(), %{mode: :expression, expression: "*/30 * * * *"})
+    due_at!(cron, ~U[2026-11-02 08:00:00Z])
+    :ok = Runner.start_due(~U[2026-11-02 08:01:00Z])
+    :ok = Runner.start_due(~U[2026-11-02 08:31:00Z])
+
+    for task <- Board.list_tasks!(), do: Board.group_task!(task, nil)
+    assert Board.list_task_groups!() == []
+
+    :ok = Runner.start_due(~U[2026-11-02 09:01:00Z])
+    :ok = Runner.start_due(~U[2026-11-02 09:31:00Z])
+
+    assert Enum.all?(Board.list_tasks!(), &is_nil(&1.group_id))
+    assert Board.list_task_groups!() == []
+  end
+
+  test "a run that can't be created leaves the run before it ungrouped" do
+    cron = cron!(human_workflow!(), %{mode: :expression, expression: "*/30 * * * *"})
+    cron = due_at!(cron, ~U[2026-11-02 08:00:00Z])
+    :ok = Runner.start_due(~U[2026-11-02 08:01:00Z])
+
+    broken = %{Recurring.get_cron!(cron.id) | repository: String.duplicate("x", 1001)}
+    assert {:error, _reason} = Runner.start(broken, ~U[2026-11-02 08:31:00Z])
+
+    assert [%{group_id: nil}] = Board.list_tasks!()
+    assert Board.list_task_groups!() == []
+  end
+
+  test "a cron's tasks keep its time zone once it is deleted" do
+    cron = cron!(human_workflow!(), %{timezone: "Europe/Warsaw"})
+    {:ok, _task} = Runner.start(cron)
+    Recurring.destroy_cron!(cron)
+
+    assert [%{cron_id: nil, cron_timezone: "Europe/Warsaw"}] = Board.list_tasks!()
+  end
+
+  test "a time shows its year when it isn't this one" do
+    this_year = DateTime.utc_now().year
+    {:ok, now} = DateTime.new(Date.new!(this_year, 3, 1), ~T[10:00:00], "Etc/UTC")
+    refute Recurring.local_time(now, "Etc/UTC") =~ "#{this_year}"
+    assert Recurring.local_time(~U[2044-02-29 00:00:00Z], "Etc/UTC") == "Mon 29 Feb 2044, 00:00"
   end
 
   test "runs far apart stay apart" do
@@ -263,6 +325,6 @@ defmodule Weworkai.Recurring.RunnerTest do
     cron!(workflow)
 
     assert {:error, error} = Workflows.destroy_workflow(workflow)
-    assert Exception.message(error) =~ "1 cron still run this workflow"
+    assert Exception.message(error) =~ "1 cron still runs this workflow"
   end
 end

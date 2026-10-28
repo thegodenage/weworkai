@@ -18,6 +18,12 @@ defmodule WeworkaiWeb.RecurringLive do
 
   @impl true
   def mount(_params, _session, socket) do
+    # Crons fire, and their tasks change, while the page is open.
+    if connected?(socket) do
+      Phoenix.PubSub.subscribe(Weworkai.PubSub, "crons")
+      Phoenix.PubSub.subscribe(Weworkai.PubSub, "tasks")
+    end
+
     {:ok,
      socket
      |> assign(
@@ -89,14 +95,21 @@ defmodule WeworkaiWeb.RecurringLive do
     end
   end
 
-  def handle_event("toggle", %{"id" => id}, socket) do
-    cron = Recurring.get_cron!(id)
+  # The row may be stale: another tab or person deleted the cron.
+  def handle_event(action, %{"id" => id}, socket) when action in ~w(toggle run delete) do
+    case Recurring.get_cron(id) do
+      {:ok, cron} -> act(action, cron, socket)
+      {:error, _} -> {:noreply, socket |> refresh() |> put_flash(:error, "Cron not found.")}
+    end
+  end
+
+  defp act("toggle", cron, socket) do
     Recurring.update_cron!(cron, %{enabled: not cron.enabled})
     {:noreply, refresh(socket)}
   end
 
-  def handle_event("run", %{"id" => id}, socket) do
-    case id |> Recurring.get_cron!() |> Runner.start() do
+  defp act("run", cron, socket) do
+    case Runner.start(cron) do
       {:ok, task} ->
         {:noreply, socket |> refresh() |> put_flash(:info, "Started “#{task.title}”.")}
 
@@ -105,10 +118,20 @@ defmodule WeworkaiWeb.RecurringLive do
     end
   end
 
-  def handle_event("delete", %{"id" => id}, socket) do
-    id |> Recurring.get_cron!() |> Recurring.destroy_cron!()
+  defp act("delete", cron, socket) do
+    Recurring.destroy_cron!(cron)
     {:noreply, socket |> refresh() |> put_flash(:info, "Cron deleted. Its tasks stay.")}
   end
+
+  @impl true
+  def handle_info(:cron_changed, socket), do: {:noreply, refresh(socket)}
+
+  # A cron's task changed or went: its row's count and last task follow.
+  def handle_info({event, %{cron_id: cron_id}}, socket)
+      when event in [:task_updated, :task_deleted] and not is_nil(cron_id),
+      do: {:noreply, refresh(socket)}
+
+  def handle_info(_message, socket), do: {:noreply, socket}
 
   # Unchecking every day still sends the hidden empty one, so the change reaches the form.
   # In expression mode the chips aren't there: the days stay as they were.
