@@ -45,11 +45,25 @@ window.addEventListener("phx:remember-task-defaults", ({detail}) => {
   } catch {}
 })
 
+// A board open in another tab hears of the task created here, so its next new task
+// starts from it too (and doesn't later write back its older defaults).
+const TaskDefaults = {
+  mounted() {
+    this.onStorage = ({key}) => {
+      if (key === TASK_DEFAULTS_KEY) this.pushEvent("remembered", {task_defaults: taskDefaults()})
+    }
+    window.addEventListener("storage", this.onStorage)
+  },
+  destroyed() {
+    window.removeEventListener("storage", this.onStorage)
+  },
+}
+
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: () => ({_csrf_token: csrfToken, task_defaults: taskDefaults()}),
-  hooks: {...colocatedHooks, Terminal, WorkflowEditor},
+  hooks: {...colocatedHooks, Terminal, WorkflowEditor, TaskDefaults},
 })
 
 // Show progress bar on live navigation and form submits

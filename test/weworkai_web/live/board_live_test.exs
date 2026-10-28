@@ -315,8 +315,78 @@ defmodule WeworkaiWeb.BoardLiveTest do
                view,
                "#task-form select[name='form[workflow_id]'] option[selected][value='#{default.id}']"
              )
+    end
 
-      refute has_element?(view, "#task-form option[value='#{lean.id}']")
+    test "anything but a non-empty repository and workflow id is ignored", %{conn: conn} do
+      default = Weworkai.Workflows.default_workflow!()
+
+      for task_defaults <- [
+            %{"repository" => "", "workflow_id" => 5, "title" => "x"},
+            "~/Projects/app",
+            [%{"repository" => "~/Projects/app"}]
+          ] do
+        {:ok, view, _html} =
+          conn
+          |> put_connect_params(%{"task_defaults" => task_defaults})
+          |> live(~p"/tasks/new")
+
+        assert has_element?(
+                 view,
+                 "#task-form input[name='form[repository]'][value='~/Projects']"
+               )
+
+        assert has_element?(
+                 view,
+                 "#task-form select[name='form[workflow_id]'] option[selected][value='#{default.id}']"
+               )
+      end
+    end
+
+    test "a task created in another tab is where the next new task starts", %{conn: conn} do
+      lean = Weworkai.Workflows.create_workflow!("Lean")
+      {:ok, view, _html} = live(conn, ~p"/")
+
+      view
+      |> element("#task-defaults")
+      |> render_hook("remembered", %{
+        "task_defaults" => %{"repository" => "~/Projects/app", "workflow_id" => lean.id}
+      })
+
+      render_patch(view, ~p"/tasks/new")
+
+      assert has_element?(
+               view,
+               "#task-form input[name='form[repository]'][value='~/Projects/app']"
+             )
+
+      assert has_element?(
+               view,
+               "#task-form select[name='form[workflow_id]'] option[selected][value='#{lean.id}']"
+             )
+    end
+
+    test "a workflow deleted while the new task form is open is an error, not a crash",
+         %{conn: conn} do
+      lean = Weworkai.Workflows.create_workflow!("Lean")
+
+      {:ok, view, _html} =
+        conn
+        |> put_connect_params(%{"task_defaults" => %{"workflow_id" => lean.id}})
+        |> live(~p"/tasks/new")
+
+      Weworkai.Workflows.destroy_workflow!(lean)
+
+      view
+      |> form("#task-form", form: %{title: "Kept", workflow_id: lean.id})
+      |> render_change()
+
+      view
+      |> form("#task-form", form: %{title: "Kept", workflow_id: lean.id})
+      |> render_submit()
+
+      assert has_element?(view, "#task-form input[name='form[title]'][value='Kept']")
+      assert has_element?(view, "#task-form", "no longer exists")
+      refute Enum.any?(Board.list_tasks!(), &(&1.title == "Kept"))
     end
 
     test "creating a task remembers its repository and workflow for the next one", %{conn: conn} do

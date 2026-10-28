@@ -62,9 +62,6 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   defp apply_action(socket, :new, _params) do
-    # Fresh, so a workflow deleted since mount is neither offered nor picked from memory.
-    socket = assign(socket, workflows: Workflows.list_workflows!())
-
     assign(socket,
       page_title: "New task",
       form: to_form(Board.form_to_create_task(params: new_task_params(socket.assigns))),
@@ -106,11 +103,14 @@ defmodule WeworkaiWeb.BoardLive do
 
   defp remembered(_connect_params), do: %{}
 
-  # A remembered workflow deleted since falls back to the default one.
+  # A remembered workflow the form doesn't offer, or one deleted since (checked afresh, as
+  # @workflows dates from mount), falls back to the default one.
   defp new_task_params(%{remembered: remembered, workflows: workflows}) do
+    id = remembered["workflow_id"]
+
     workflow_id =
-      if Enum.any?(workflows, &(&1.id == remembered["workflow_id"])),
-        do: remembered["workflow_id"],
+      if Enum.any?(workflows, &(&1.id == id)) and match?({:ok, _}, Workflows.get_workflow(id)),
+        do: id,
         else: Workflows.default_workflow!().id
 
     %{
@@ -125,6 +125,10 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   @impl true
+  # Another tab created a task (the TaskDefaults hook in assets/js/app.js).
+  def handle_event("remembered", params, socket),
+    do: {:noreply, assign(socket, remembered: remembered(params))}
+
   def handle_event("validate", %{"form" => params}, socket) do
     {:noreply, assign(socket, form: AshPhoenix.Form.validate(socket.assigns.form, params))}
   end
@@ -568,6 +572,8 @@ defmodule WeworkaiWeb.BoardLive do
           <.icon name="hero-x-mark-micro" class="size-4" /> Clear
         </button>
       </form>
+
+      <div id="task-defaults" phx-hook="TaskDefaults" class="hidden"></div>
 
       <div id="board" phx-hook=".Board" class="flex scroll-smooth gap-3 overflow-x-auto pb-6">
         <section
