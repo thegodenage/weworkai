@@ -331,9 +331,6 @@ body {
 [data-theme=light] .tone-green { --tone: #15803d; --tone-soft: rgb(34 197 94 / 0.1); }
 [data-theme=light] .tone-red { --tone: #b91c1c; --tone-soft: rgb(239 68 68 / 0.1); }
 
-.emblem-light { display: none; }
-[data-theme=light] .emblem-dark { display: none; }
-[data-theme=light] .emblem-light { display: block; }
 
 /* daisyUI buttons, squared and set like labels; primary lifts onto a hard shadow. */
 @layer components {

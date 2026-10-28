@@ -57,8 +57,7 @@ defmodule WeworkaiWeb.Layouts do
       >
         <div class="mb-8 flex flex-col items-center gap-3 sm:flex-row sm:justify-between sm:gap-2 sm:group-data-rail/nav:flex-col sm:group-data-rail/nav:gap-3">
           <.link navigate={~p"/"} class="flex items-center gap-2 sm:px-1">
-            <img src={~p"/images/emblem_white.png"} alt="" class="emblem-dark size-8 shrink-0" />
-            <img src={~p"/images/emblem_black.png"} alt="" class="emblem-light size-8 shrink-0" />
+            <img src={~p"/images/logo.svg"} alt="" class="size-8 shrink-0" />
             <span class="sr-only flex-col sm:not-sr-only sm:flex sm:group-data-rail/nav:sr-only">
               <span class="text-sm leading-none font-bold tracking-[0.12em] uppercase">
                 Weworkai

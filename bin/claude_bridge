@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Lets the Dockerized app run Claude Code agents on this computer, each in a throwaway container.
 
 Run it on the host (not in Docker): `bin/claude_bridge`. It listens on 127.0.0.1 only;
@@ -51,7 +52,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOKEN_FILE = REPO_ROOT / ".claude-bridge-token"
 ROOTS = [
     pathlib.Path(root).expanduser().resolve()
-    for root in os.environ.get("CLAUDE_BRIDGE_ROOTS", "~/Projects").split(":")
+    for root in os.environ.get("CLAUDE_BRIDGE_ROOTS", "~:~/Projects").split(":")
 ]
 STATE_DIR = pathlib.Path(os.environ.get("CLAUDE_BRIDGE_STATE", "~/.weworkai-bridge")).expanduser()
 RUNS_DIR = STATE_DIR / "runs"

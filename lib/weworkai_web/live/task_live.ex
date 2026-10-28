@@ -245,8 +245,8 @@ defmodule WeworkaiWeb.TaskLive do
          |> load(task)
          |> put_flash(:info, "Plan approved. #{task.assignee.name} starts coding.")}
 
-      {:error, _} ->
-        {:noreply, put_flash(socket, :error, "Could not hand the plan to that coder.")}
+      {:error, error} ->
+        {:noreply, put_flash(socket, :error, Weworkai.ErrorText.readable(error))}
     end
   end
 
