@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 
+# Sourcing defines nothing and changes nothing in the caller's shell; this script is meant to be executed.
+if (return 0 2>/dev/null); then
+  printf 'hello.sh: run this script instead of sourcing it\n' >&2
+  return 0
+fi
+
+set -euo pipefail
+
 usage() {
   printf 'Usage: %s [-h|--help] [--] [author]\n' "${0##*/}"
   printf 'Greets everyone reading the author'\''s posts (default author: thegodenage).\n'
@@ -42,8 +50,4 @@ main() {
   printf 'Hello, everyone reading %s posts! 👋\n' "${author:-thegodenage}"
 }
 
-# Only run when executed, so sourcing doesn't change the caller's shell options or exit it.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  set -euo pipefail
-  main "$@"
-fi
+main "$@"
