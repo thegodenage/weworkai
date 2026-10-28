@@ -264,12 +264,8 @@ defmodule WeworkaiWeb.BoardLiveTest do
     test "a new task starts from the ones the browser remembers", %{conn: conn} do
       lean = Weworkai.Workflows.create_workflow!("Lean")
 
-      {:ok, view, _html} =
-        conn
-        |> put_connect_params(%{
-          "task_defaults" => %{"repository" => "~/Projects/app", "workflow_id" => lean.id}
-        })
-        |> live(~p"/tasks/new")
+      {:ok, view, _html} = live(conn, ~p"/tasks/new")
+      browser_remembers(view, %{"repository" => "~/Projects/app", "workflow_id" => lean.id})
 
       assert has_element?(
                view,
@@ -285,10 +281,8 @@ defmodule WeworkaiWeb.BoardLiveTest do
     test "a remembered workflow that no longer exists falls back to the default", %{conn: conn} do
       default = Weworkai.Workflows.default_workflow!()
 
-      {:ok, view, _html} =
-        conn
-        |> put_connect_params(%{"task_defaults" => %{"workflow_id" => Ash.UUID.generate()}})
-        |> live(~p"/tasks/new")
+      {:ok, view, _html} = live(conn, ~p"/tasks/new")
+      browser_remembers(view, %{"workflow_id" => Ash.UUID.generate()})
 
       assert has_element?(
                view,
@@ -303,10 +297,8 @@ defmodule WeworkaiWeb.BoardLiveTest do
       lean = Weworkai.Workflows.create_workflow!("Lean")
       default = Weworkai.Workflows.default_workflow!()
 
-      {:ok, view, _html} =
-        conn
-        |> put_connect_params(%{"task_defaults" => %{"workflow_id" => lean.id}})
-        |> live(~p"/")
+      {:ok, view, _html} = live(conn, ~p"/")
+      browser_remembers(view, %{"workflow_id" => lean.id})
 
       Weworkai.Workflows.destroy_workflow!(lean)
       render_patch(view, ~p"/tasks/new")
@@ -325,10 +317,8 @@ defmodule WeworkaiWeb.BoardLiveTest do
             "~/Projects/app",
             [%{"repository" => "~/Projects/app"}]
           ] do
-        {:ok, view, _html} =
-          conn
-          |> put_connect_params(%{"task_defaults" => task_defaults})
-          |> live(~p"/tasks/new")
+        {:ok, view, _html} = live(conn, ~p"/tasks/new")
+        browser_remembers(view, task_defaults)
 
         assert has_element?(
                  view,
@@ -343,14 +333,15 @@ defmodule WeworkaiWeb.BoardLiveTest do
     end
 
     test "a task created in another tab is where the next new task starts", %{conn: conn} do
-      lean = Weworkai.Workflows.create_workflow!("Lean")
       {:ok, view, _html} = live(conn, ~p"/")
+      # Created after this board mounted, as another tab would.
+      lean = Weworkai.Workflows.create_workflow!("Lean")
 
-      view
-      |> element("#task-defaults")
-      |> render_hook("remembered", %{
-        "task_defaults" => %{"repository" => "~/Projects/app", "workflow_id" => lean.id}
-      })
+      browser_remembers(
+        view,
+        %{"repository" => "~/Projects/app", "workflow_id" => lean.id},
+        false
+      )
 
       render_patch(view, ~p"/tasks/new")
 
@@ -369,10 +360,8 @@ defmodule WeworkaiWeb.BoardLiveTest do
          %{conn: conn} do
       lean = Weworkai.Workflows.create_workflow!("Lean")
 
-      {:ok, view, _html} =
-        conn
-        |> put_connect_params(%{"task_defaults" => %{"workflow_id" => lean.id}})
-        |> live(~p"/tasks/new")
+      {:ok, view, _html} = live(conn, ~p"/tasks/new")
+      browser_remembers(view, %{"workflow_id" => lean.id})
 
       Weworkai.Workflows.destroy_workflow!(lean)
 
@@ -417,6 +406,13 @@ defmodule WeworkaiWeb.BoardLiveTest do
                "#task-form select[name='form[workflow_id]'] option[selected][value='#{lean.id}']"
              )
     end
+  end
+
+  # What the TaskDefaults hook (assets/js/app.js) sends from localStorage.
+  defp browser_remembers(view, task_defaults, initial \\ true) do
+    view
+    |> element("#task-defaults")
+    |> render_hook("remembered", %{"task_defaults" => task_defaults, "initial" => initial})
   end
 
   defp unconfigured_planner do

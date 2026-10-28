@@ -28,7 +28,7 @@ import Terminal from "./hooks/terminal"
 import WorkflowEditor from "./workflow_editor"
 
 // The repository and workflow of the last task created, so the next new task starts from
-// them (BoardLive). Sent on every connect; BoardLive pushes fresh ones after each create.
+// them (BoardLive). BoardLive pushes fresh ones after each create.
 const TASK_DEFAULTS_KEY = "weworkai:task-defaults"
 
 const taskDefaults = () => {
@@ -45,24 +45,33 @@ window.addEventListener("phx:remember-task-defaults", ({detail}) => {
   } catch {}
 })
 
-// A board open in another tab hears of the task created here, so its next new task
-// starts from it too (and doesn't later write back its older defaults).
+// Hands the board the stored defaults over its channel (not the socket URL, which a long
+// repository would push past the server's limit): on connect, and whenever another tab
+// creates a task, so it neither starts from nor later writes back older ones.
 const TaskDefaults = {
   mounted() {
-    this.onStorage = ({key}) => {
-      if (key === TASK_DEFAULTS_KEY) this.pushEvent("remembered", {task_defaults: taskDefaults()})
-    }
+    this.send(true)
+    this.onStorage = ({key}) => key === TASK_DEFAULTS_KEY && this.send(false)
     window.addEventListener("storage", this.onStorage)
+  },
+  reconnected() {
+    this.send(true)
   },
   destroyed() {
     window.removeEventListener("storage", this.onStorage)
+  },
+  send(initial) {
+    // Rejected while disconnected; it hears them on reconnect instead.
+    Promise.resolve()
+      .then(() => this.pushEvent("remembered", {task_defaults: taskDefaults(), initial}))
+      .catch(() => {})
   },
 }
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
-  params: () => ({_csrf_token: csrfToken, task_defaults: taskDefaults()}),
+  params: {_csrf_token: csrfToken},
   hooks: {...colocatedHooks, Terminal, WorkflowEditor, TaskDefaults},
 })
 

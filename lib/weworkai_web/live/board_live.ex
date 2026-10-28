@@ -29,7 +29,7 @@ defmodule WeworkaiWeb.BoardLive do
         employees: Organization.list_all_employees!(),
         block_labels: block_labels(workflows),
         filters: @no_filters,
-        remembered: remembered(get_connect_params(socket))
+        remembered: %{}
       )
       |> show_tasks()
       |> allow_upload(:attachments,
@@ -62,9 +62,13 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   defp apply_action(socket, :new, _params) do
+    # Fresh, unlike @workflows (the board filter's, from mount): a workflow created or
+    # deleted since in another tab is offered, or not, accordingly.
+    socket = assign(socket, form_workflows: Workflows.list_workflows!())
+
     assign(socket,
       page_title: "New task",
-      form: to_form(Board.form_to_create_task(params: new_task_params(socket.assigns))),
+      form: new_task_form(socket.assigns),
       task: nil,
       details_form: nil,
       continue_targets: [],
@@ -92,7 +96,8 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   # The browser remembers the repository and workflow of the last task created
-  # (assets/js/app.js) and sends them on connect; the next new task starts from them.
+  # (assets/js/app.js) and sends them once the board connects, and again whenever another
+  # tab creates a task; the next new task starts from them.
   @remembered ["repository", "workflow_id"]
 
   defp remembered(%{"task_defaults" => %{} = stored}) do
@@ -101,22 +106,21 @@ defmodule WeworkaiWeb.BoardLive do
         do: {key, value}
   end
 
-  defp remembered(_connect_params), do: %{}
+  defp remembered(_params), do: %{}
 
-  # A remembered workflow the form doesn't offer, or one deleted since (checked afresh, as
-  # @workflows dates from mount), falls back to the default one.
-  defp new_task_params(%{remembered: remembered, workflows: workflows}) do
+  # A remembered workflow deleted since falls back to the default one.
+  defp new_task_form(%{remembered: remembered, form_workflows: workflows}) do
     id = remembered["workflow_id"]
 
     workflow_id =
-      if Enum.any?(workflows, &(&1.id == id)) and match?({:ok, _}, Workflows.get_workflow(id)),
-        do: id,
-        else: Workflows.default_workflow!().id
+      if Enum.any?(workflows, &(&1.id == id)), do: id, else: Workflows.default_workflow!().id
 
-    %{
+    params = %{
       "repository" => Map.get(remembered, "repository", Task.default_repository()),
       "workflow_id" => workflow_id
     }
+
+    to_form(Board.form_to_create_task(params: params))
   end
 
   defp remember(socket, task) do
@@ -125,9 +129,18 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   @impl true
-  # Another tab created a task (the TaskDefaults hook in assets/js/app.js).
-  def handle_event("remembered", params, socket),
-    do: {:noreply, assign(socket, remembered: remembered(params))}
+  # From the TaskDefaults hook (assets/js/app.js). The first arrives just after connecting,
+  # so a New form opened by loading /tasks/new still starts from them.
+  def handle_event("remembered", params, socket) do
+    socket = assign(socket, remembered: remembered(params))
+
+    socket =
+      if params["initial"] && socket.assigns.live_action == :new,
+        do: assign(socket, form: new_task_form(socket.assigns)),
+        else: socket
+
+    {:noreply, socket}
+  end
 
   def handle_event("validate", %{"form" => params}, socket) do
     {:noreply, assign(socket, form: AshPhoenix.Form.validate(socket.assigns.form, params))}
@@ -1019,7 +1032,7 @@ defmodule WeworkaiWeb.BoardLive do
             field={@form[:workflow_id]}
             type="select"
             label="Workflow"
-            options={workflow_options(@workflows)}
+            options={workflow_options(@form_workflows)}
             class="select w-full"
           />
           <p class="mb-2 text-xs text-(--orpheus-text-muted)">
