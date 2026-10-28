@@ -714,6 +714,10 @@ defmodule WeworkaiWeb.CoreComponents do
     </div>
     <script :type={Phoenix.LiveView.ColocatedHook} name=".MarkdownEditor">
       const reference = ({name}) => `![${name}](${name})`
+      const extension = (type) => {
+        const subtype = type.split("/")[1]?.split("+")[0]
+        return subtype ? `.${subtype === "jpeg" ? "jpg" : subtype}` : ""
+      }
       const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
       export default {
@@ -749,7 +753,8 @@ defmodule WeworkaiWeb.CoreComponents do
               `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-` +
               `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${pad(now.getMilliseconds(), 3)}`
             const named = images.map((file, i) => {
-              const ext = file.name.match(/\.[A-Za-z0-9]+$/)?.[0] ?? ""
+              // A nameless file still needs its extension: attachments are told apart by it.
+              const ext = file.name.match(/\.[A-Za-z0-9]+$/)?.[0] ?? extension(file.type)
               const index = images.length > 1 ? `-${i + 1}` : ""
               return new File([file], `screenshot-${stamp}${index}${ext}`, {type: file.type})
             })
@@ -759,12 +764,29 @@ defmodule WeworkaiWeb.CoreComponents do
             const before = start > 0 && value[start - 1] !== "\n" ? "\n" : ""
             const after = end < value.length && value[end] !== "\n" ? "\n" : ""
             this.replaceSelection(textarea, before + named.map(reference).join("\n") + after)
+            named.forEach(({name}) => this.pasted.add(name))
+            // Save now, not after the debounce: leaving first could save it to another task.
+            textarea.dispatchEvent(new FocusEvent("blur"))
+          })
+
+          // ⌘Z of a paste takes its file back out too.
+          this.pasted = new Set()
+          textarea.addEventListener("input", (event) => {
+            if (event.inputType !== "historyUndo") return
+            for (const name of this.pasted) {
+              if (textarea.value.includes(reference({name}))) continue
+              this.pasted.delete(name)
+              this.pushEvent("unpaste", {name})
+            }
           })
 
           // A cancelled or removed file takes its pasted reference with it.
-          this.handleEvent("file-removed", ({name}) => {
+          this.handleEvent("file-removed", ({name, task_id}) => {
+            // The drawer may have moved on to another task, which keeps its references.
+            if ((textarea.dataset.taskId ?? null) !== task_id) return
             const ref = escapeRegExp(reference({name}))
-            const line = new RegExp(`^${ref}\n?|\n?${ref}`, "gm")
+            // Only a reference on its own line, as pasted; code that mentions it isn't one.
+            const line = new RegExp(`^${ref}\n|\n?^${ref}$`, "gm")
             if (!line.test(textarea.value)) return
             textarea.value = textarea.value.replace(line, "")
             textarea.dispatchEvent(new Event("input", {bubbles: true}))

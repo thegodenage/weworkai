@@ -191,6 +191,24 @@ defmodule WeworkaiWeb.BoardLive do
     {:noreply, put_flash(socket, :error, "#{count} not pasted: at most #{max} files at a time.")}
   end
 
+  # A paste undone in the editor (⌘Z) takes its file back out: a pending upload is cancelled,
+  # an attached one removed.
+  def handle_event("unpaste", %{"name" => name}, socket) do
+    socket =
+      socket.assigns.uploads.attachments.entries
+      |> Enum.filter(&(&1.client_name == name and pasted?(name)))
+      |> Enum.reduce(socket, &cancel_upload(&2, :attachments, &1.ref))
+
+    case Enum.find(socket.assigns.attachments, &(&1.name == name and pasted?(name))) do
+      nil ->
+        {:noreply, socket}
+
+      attachment ->
+        Board.remove_attachment!(attachment)
+        {:noreply, assign(socket, attachments: Board.list_attachments!(socket.assigns.task.id))}
+    end
+  end
+
   def handle_event("remove_attachment", %{"id" => id}, socket) do
     attachment = Enum.find(socket.assigns.attachments, &(&1.id == id))
     Board.remove_attachment!(attachment)
@@ -303,7 +321,7 @@ defmodule WeworkaiWeb.BoardLive do
     case String.downcase(String.trim(query)) do
       "" -> true
       query ->
-        text = without_images("#{task.title} #{task.description}")
+        text = without_pasted("#{task.title} #{task.description}")
         String.contains?(String.downcase(text), query)
     end
   end
@@ -464,15 +482,20 @@ defmodule WeworkaiWeb.BoardLive do
 
   defp uploading?(upload), do: Enum.any?(upload.entries, &(not &1.done?))
 
-  # Files that won't be attached take their pasted `![name](name)` references with them: the
-  # editor drops them from its textarea, and the drawer's task from its saved description, as
-  # the editor's debounced save is lost if the drawer closes first.
-  defp forget_files(socket, []), do: socket
-
+  # Pasted files that won't be attached take their `![name](name)` lines with them: the editor
+  # drops them from its textarea, and the drawer's task from its saved description, as the
+  # editor's debounced save is lost if the drawer closes first. Only names the editor made
+  # count, and only while no file of that name stays attached (an upload may replace one).
   defp forget_files(socket, names) do
-    socket = Enum.reduce(names, socket, &push_event(&2, "file-removed", %{name: &1}))
+    attached = socket.assigns |> Map.get(:attachments, []) |> MapSet.new(& &1.name)
+    names = Enum.filter(names, &(pasted?(&1) and not MapSet.member?(attached, &1)))
+    task_id = socket.assigns[:task] && socket.assigns.task.id
 
-    with %Task{id: id} <- socket.assigns[:task],
+    socket =
+      Enum.reduce(names, socket, &push_event(&2, "file-removed", %{name: &1, task_id: task_id}))
+
+    with [_ | _] <- names,
+         %Task{id: id} <- socket.assigns[:task],
          {:ok, task} <- Board.get_task(id),
          description when description != task.description <-
            without_references(task.description, names),
@@ -489,13 +512,22 @@ defmodule WeworkaiWeb.BoardLive do
 
   defp without_references(description, names) do
     Enum.reduce(names, description, fn name, description ->
+      # Only a reference on its own line, as pasted; code that mentions it isn't one.
       reference = Regex.escape("![#{name}](#{name})")
-      line = Regex.compile!("^#{reference}\\n?|\\n?#{reference}", "m")
+      line = Regex.compile!("^#{reference}\\n|\\n?^#{reference}$", "m")
       String.replace(description, line, "")
     end)
   end
 
-  # Image references are long and say nothing, so cards and search skip them.
+  # The names the description editor gives pasted images.
+  defp pasted?(name),
+    do: name =~ ~r/^screenshot-\d{4}-\d{2}-\d{2}-\d{6}-\d{3}(-\d+)?(\.[A-Za-z0-9]+)?$/
+
+  # Pasted references are long and say nothing, so search skips them.
+  defp without_pasted(text),
+    do: String.replace(text, ~r/!\[(screenshot-[\d-]+(\.[A-Za-z0-9]+)?)\]\(\1\)/, "")
+
+  # Image references are long and say nothing on a card.
   defp without_images(text), do: String.replace(text, ~r/!\[[^\]]*\]\([^)]*\)/, "")
 
   defp excerpt(nil), do: nil
@@ -980,6 +1012,7 @@ defmodule WeworkaiWeb.BoardLive do
               field={@details_form[:description]}
               upload={@uploads.attachments}
               files={attachment_urls(@attachments)}
+              data-task-id={@task.id}
               placeholder="Add a description… Paste a screenshot to attach it."
               rows="12"
               phx-debounce="800"

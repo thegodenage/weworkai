@@ -42,16 +42,25 @@ defmodule WeworkaiWeb.BoardLiveTest do
     Board.create_task!(%{title: "Write spec", description: "First draft"})
     lean = Weworkai.Workflows.create_workflow!("Lean")
     login = Board.create_task!(%{title: "Fix login", workflow_id: lean.id})
-    Board.create_task!(%{title: "Pasted shot", description: "![shot.png](shot.png)"})
+    pasted = "screenshot-2026-10-28-143005-123.png"
+    Board.create_task!(%{title: "Pasted shot", description: "![#{pasted}](#{pasted})"})
+
+    Board.create_task!(%{
+      title: "Diagram",
+      description: "![kubernetes topology](https://example.com/k8s.png)"
+    })
+
     {:ok, view, _html} = live(conn, ~p"/")
 
     view |> form("#board-filters", filter: %{q: "draft"}) |> render_change()
     assert has_element?(view, "#column-backlog article", "Write spec")
     refute has_element?(view, "#column-backlog article", "Fix login")
 
-    # Search skips the image references the cards hide.
+    # Search skips pasted screenshot references, but not other images' text.
     view |> form("#board-filters", filter: %{q: "png"}) |> render_change()
     refute has_element?(view, "#column-backlog article", "Pasted shot")
+    view |> form("#board-filters", filter: %{q: "kubernetes"}) |> render_change()
+    assert has_element?(view, "#column-backlog article", "Diagram")
 
     view |> form("#board-filters", filter: %{q: "", workflow: lean.id}) |> render_change()
     assert has_element?(view, "#column-backlog article", "Fix login")
@@ -462,9 +471,63 @@ defmodule WeworkaiWeb.BoardLiveTest do
 
     assert Board.list_attachments!(task.id) == []
     refute has_element?(view, "#attachment-#{id}")
-    # The description drops its pasted reference to the removed file, saved at once.
-    assert_push_event(view, "file-removed", %{name: "mock up.png"})
+    # A reference the user wrote stays; only pasted ones go with their file.
+    assert Board.get_task!(task.id).description == "Intro\n![mock up.png](mock up.png)"
+  end
+
+  test "removing a pasted screenshot drops its reference, saved at once", %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Pasted", description: "Intro\n![#{name}](#{name})"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: "png", type: "image/png"}
+    ])
+    |> render_upload(name)
+
+    [%{id: id}] = Board.list_attachments!(task.id)
+    view |> element("#remove-attachment-#{id}") |> render_click()
+
+    task_id = task.id
+    assert_push_event(view, "file-removed", %{name: ^name, task_id: ^task_id})
     assert Board.get_task!(task.id).description == "Intro"
+  end
+
+  test "cancelling a replacement upload keeps the reference to the attached file",
+       %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Replaced", description: "![#{name}](#{name})"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+    file = %{name: name, content: String.duplicate("png", 100), type: "image/png"}
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [file])
+    |> render_upload(name)
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [file])
+    |> render_upload(name, 10)
+
+    view |> element("#task-drawer [id^='cancel-upload-']") |> render_click()
+
+    assert Board.get_task!(task.id).description == "![#{name}](#{name})"
+    assert [_] = Board.list_attachments!(task.id)
+  end
+
+  test "undoing a paste removes the pasted file", %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Undone"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: "png", type: "image/png"}
+    ])
+    |> render_upload(name)
+
+    render_hook(view, "unpaste", %{"name" => name})
+    assert Board.list_attachments!(task.id) == []
   end
 
   test "closing the drawer mid-upload drops the file's saved reference and says so",
