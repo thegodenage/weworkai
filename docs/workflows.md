@@ -28,7 +28,13 @@ workflow (its start block, or the block it is on), and the workflow assigns it. 
 naming an agent runs that agent (it must be able to run). A role block runs the first
 agent in the role that can run (by id); a coder role block runs the task's
 `pinned_coder_id` instead when the plan's approval picked one (binding: it must be able to
-run). When the block about to run has no agent that can, the action is refused naming the
+run). **Default agents**: a role block whose role has no agent at all, while a connector
+is connected, makes one first (`Organization.DefaultAgent`): an agent employee named after
+the role ("Planner", "Docker reviewer", …) on the first connected connector by name, with
+the first model it offers and the role's default prompt. It stays an ordinary employee,
+configurable on the Employees page, and the role's later blocks run it; a role with any
+agent never gets one. So a fresh install runs the template workflows with only a connector.
+When the block about to run has no agent that can, the action is refused naming the
 block and what is missing ("Coder can't run: No coder agent yet. Add one on the
 Employees page.", "Ada can't run: Ada has no model yet. …"); the card stays put. A
 reviewer / qa role block with no agent that can run is skipped with a `stage_skipped`

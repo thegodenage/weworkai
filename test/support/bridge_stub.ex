@@ -137,6 +137,12 @@ defmodule Weworkai.BridgeStub do
       {"POST", "/worktrees/diff"} ->
         Req.Test.json(conn, %{"diff" => @diff, "truncated" => false})
 
+      {"GET", "/models"} ->
+        Req.Test.json(conn, %{
+          "models" => [%{"id" => "claude-opus-5-5", "label" => "Opus 5.5"}],
+          "efforts" => ["low", "medium", "high"]
+        })
+
       {"GET", "/folders"} ->
         folders(conn, URI.decode_query(conn.query_string)["path"])
     end

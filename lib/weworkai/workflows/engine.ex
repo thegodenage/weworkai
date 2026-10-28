@@ -24,6 +24,7 @@ defmodule Weworkai.Workflows.Engine do
   alias Weworkai.Agents.Budget
   alias Weworkai.Agents.Errors.NotRunnable
   alias Weworkai.Board.Errors.{NoAgent, NoWorktree}
+  alias Weworkai.Organization.DefaultAgent
   alias Weworkai.Scheduling.{StartFailure, Timeout}
   alias Weworkai.Workflows.{Graph, Prompts, Result, Transition}
   alias Weworkai.Workflows.Errors.{Refused, WorktreeRefused}
@@ -806,10 +807,12 @@ defmodule Weworkai.Workflows.Engine do
 
   # Which agent runs a block: the one it names; for a role, the first that can run, or for
   # a coder role the one pinned when the plan was approved (which then must be able to
-  # run). A reviewer role with none that can run is skipped, unless a human asked for it by
-  # Continue while its agents only lack setup. A refusal names the block.
+  # run). A role nobody has yet gets its default agent while a connector is connected
+  # (`Organization.DefaultAgent`). A reviewer role with none that can run is skipped, unless
+  # a human asked for it by Continue while its agents only lack setup. A refusal names the
+  # block.
   defp pick(%{employee_id: nil} = node, role, task, arrival) do
-    agents = agents_in(role)
+    agents = with [] <- agents_in(role), do: List.wrap(DefaultAgent.provision(role))
     pinned = role == :coder && Enum.find(agents, &(&1.employee.id == task.pinned_coder_id))
     runnable = Enum.find(agents, &runnable?/1)
 

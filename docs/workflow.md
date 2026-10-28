@@ -67,7 +67,9 @@ review. A task without a worktree (never coded) is refused (`Validations.Reviewa
 - Moving a task to `todo` runs its workflow: its current block again, or the start block
   (docs/workflows.md). The block's role decides what the run does; which agent runs it is
   the block's own, else the first in the role that can run (the coder picked at approval
-  for a coder role block); the task needs no assignee, and gets the agent as one. A custom
+  for a coder role block), else, for a role with no agent at all while a connector is
+  connected, the role's default agent, made then (`Organization.DefaultAgent`, see
+  docs/workflows.md); the task needs no assignee, and gets the agent as one. A custom
   agent runs the task description as-is. A block whose agent can't run (no model or no
   connector) is refused at the move, naming the block (error `Agents.Errors.NotRunnable`:
   "Planner can't run: E2E Planner has no model yet. Configure it on the Employees
@@ -106,7 +108,8 @@ review. A task without a worktree (never coded) is refused (`Validations.Reviewa
   - Filters on the copy's `updated_at`, so a second tab or a double click is refused.
 - Every status change the workflow makes (and every agent failure) creates a Notification.
 - A review block with no runnable agent in its role (`reviewer` / `qa`: model + connector
-  set) is skipped with a `stage_skipped` notification. The first runnable one (by id) is used.
+  set) is skipped with a `stage_skipped` notification, unless the role has no agent at all
+  and a connector is connected: then its default agent runs. The first runnable one (by id) is used.
 - The review loop counts **fix rounds**: `review_round` goes up each time the coder is sent
   back with findings; the limit shown ("fix round n of 3") is the sum of the caps of the
   workflow's findings arrows into coder blocks (`Engine.fix_round_limit/1`).

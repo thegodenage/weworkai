@@ -259,6 +259,25 @@ defmodule WeworkaiWeb.TaskLiveTest do
     assert has_element?(view, "#no-coder")
   end
 
+  test "with a connected connector and no coder, approval makes the default coder",
+       %{conn: conn, connector: connector} = context do
+    task = planned_task(context)
+
+    connector
+    |> Ash.Changeset.for_update(:update, %{})
+    |> Ash.Changeset.force_change_attribute(:status, :connected)
+    |> Ash.update!()
+
+    view = open(conn, ~p"/tasks/#{task.id}")
+    assert has_element?(view, "#default-coder")
+    refute has_element?(view, "#approve-plan[disabled]")
+
+    view |> form("#approve-form") |> render_submit()
+
+    assert has_element?(view, "#flash-info", "Plan approved. Coder starts coding.")
+    assert %{assignee: %{name: "Coder"}} = Board.get_task!(task.id, load: :assignee)
+  end
+
   test "only coders that can run are offered", %{conn: conn, connector: connector} = context do
     task = planned_task(context)
     agent(connector, "Ada", :coder)

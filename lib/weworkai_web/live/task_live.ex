@@ -19,6 +19,7 @@ defmodule WeworkaiWeb.TaskLive do
   alias Weworkai.Agents.Usage
   alias Weworkai.Board.ProofOfWork
   alias Weworkai.Board.Task.Activity
+  alias Weworkai.Organization.DefaultAgent
   alias Weworkai.Scheduling.Job.Stage
   alias Weworkai.Scheduling.ScheduledJob.State
   alias WeworkaiWeb.{FolderPicker, TaskBudget, TaskDependencies}
@@ -89,6 +90,7 @@ defmodule WeworkaiWeb.TaskLive do
       steps: plan_steps(task.plan),
       approval: approval,
       coders: coders(approval),
+      default_coder?: default_coder?(approval),
       decisions: decisions(task, graph, approval),
       max_fix_rounds: Engine.fix_round_limit(graph),
       continue_targets: Board.continue_targets(task),
@@ -165,6 +167,11 @@ defmodule WeworkaiWeb.TaskLive do
     |> Enum.filter(&(is_nil(block.employee_id) or &1.id == block.employee_id))
     |> Enum.sort_by(& &1.name)
   end
+
+  # A coder role block with no coder at all gets the default one at approval, while a
+  # connector is connected.
+  defp default_coder?(%{employee_id: nil}), do: DefaultAgent.available?(:coder)
+  defp default_coder?(_block), do: false
 
   # The human block's arrows as buttons; the plan approval has its own control.
   defp decisions(task, graph, approval) do
@@ -689,7 +696,12 @@ defmodule WeworkaiWeb.TaskLive do
             targets={@continue_targets}
             working?={Activity.workflow?(@task.activity)}
           />
-          <.approve_control :if={@approval} task={@task} coders={@coders} />
+          <.approve_control
+            :if={@approval}
+            task={@task}
+            coders={@coders}
+            default_coder?={@default_coder?}
+          />
           <form
             :if={@decisions != []}
             id="decision-form"
@@ -913,6 +925,7 @@ defmodule WeworkaiWeb.TaskLive do
 
   attr :task, :map, required: true
   attr :coders, :list, required: true
+  attr :default_coder?, :boolean, default: false
 
   defp approve_control(assigns) do
     ~H"""
@@ -923,7 +936,15 @@ defmodule WeworkaiWeb.TaskLive do
     >
       <%= case @coders do %>
         <% [] -> %>
-          <span id="no-coder" class="text-xs text-(--orpheus-text-muted)">
+          <span
+            :if={@default_coder?}
+            id="default-coder"
+            class="inline-flex items-center gap-1 text-xs text-(--orpheus-text-muted)"
+          >
+            <.icon name="hero-sparkles-micro" class="size-3.5" />
+            A default coder is created on your connector.
+          </span>
+          <span :if={!@default_coder?} id="no-coder" class="text-xs text-(--orpheus-text-muted)">
             No coder agent yet. <.link navigate={~p"/employees/new"} class="text-primary underline">Add one</.link>.
           </span>
         <% [_coder] -> %>
@@ -940,12 +961,12 @@ defmodule WeworkaiWeb.TaskLive do
       <button
         id="approve-plan"
         type="submit"
-        disabled={@coders == []}
+        disabled={@coders == [] and not @default_coder?}
         data-confirm={
           @task.open_questions != [] &&
             "#{length(@task.open_questions)} unanswered decisions. Approve the plan anyway?"
         }
-        title={@coders == [] && "Add an agent with the coder role first"}
+        title={@coders == [] and not @default_coder? && "Add an agent with the coder role first"}
         phx-disable-with="Handing over…"
         class="btn btn-primary btn-sm shadow-sm shadow-primary/30 transition-transform active:scale-[0.98]"
       >
