@@ -7,6 +7,8 @@ defmodule WeworkaiWeb.TaskComponents do
   alias Weworkai.Agents.Errors.NotRunnable
   alias Weworkai.Board.Errors.{NoAgent, NoWorktree}
   alias Weworkai.Workflows.Errors.{Refused, WorktreeRefused}
+  alias Weworkai.Board.Task
+  alias Weworkai.Recurring
   alias Weworkai.Board.Task.{Activity, Stage, Status}
   alias Weworkai.ErrorText
   alias Phoenix.LiveView.JS
@@ -79,6 +81,43 @@ defmodule WeworkaiWeb.TaskComponents do
           style={"width: #{if @total == 0, do: 0, else: div(@done * 100, @total)}%"}
         ></span>
       </span>
+    </span>
+    """
+  end
+
+  attr :tag, :string, required: true
+  attr :rest, :global
+
+  @doc "One of a task's tags; a cron's own (CRON) stands out."
+  def task_tag(assigns) do
+    assigns = assign(assigns, cron?: assigns.tag == Task.cron_tag())
+
+    ~H"""
+    <span
+      data-tag={@tag}
+      class={["orpheus-badge", if(@cron?, do: "tone-sky", else: "tone-slate")]}
+      {@rest}
+    >
+      <.icon :if={@cron?} name="hero-arrow-path-micro" class="size-3" />
+      {@tag}
+    </span>
+    """
+  end
+
+  attr :at, DateTime, required: true
+  attr :timezone, :string, default: nil
+  attr :rest, :global
+
+  @doc "When the cron that created the task was due, on the cron's clock."
+  def cron_time(assigns) do
+    ~H"""
+    <span
+      class="inline-flex items-center gap-1 font-mono text-[11px] text-(--orpheus-text-muted)"
+      title={"Scheduled run (#{@timezone || "Etc/UTC"})"}
+      {@rest}
+    >
+      <.icon name="hero-clock-micro" class="size-3" />
+      {Recurring.local_time(@at, @timezone)}
     </span>
     """
   end

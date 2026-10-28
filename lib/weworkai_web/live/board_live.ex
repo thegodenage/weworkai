@@ -11,8 +11,11 @@ defmodule WeworkaiWeb.BoardLive do
 
   import WeworkaiWeb.TaskComponents
 
-  # Search text, workflow id, assignee id ("none": nobody) and block label; "" lets all through.
-  @no_filters %{"q" => "", "workflow" => "", "assignee" => "", "block" => ""}
+  # Search text, workflow id, assignee id ("none": nobody), block label and tag; "" lets all through.
+  @no_filters %{"q" => "", "workflow" => "", "assignee" => "", "block" => "", "tag" => ""}
+
+  # Each column's stacks, one per group with cards there (`regroup/4`).
+  @group_streams Map.new(Status.values(), &{&1, :"#{&1}_groups"})
 
   @impl true
   def mount(_params, _session, socket) do
@@ -28,7 +31,9 @@ defmodule WeworkaiWeb.BoardLive do
         workflows: workflows,
         employees: Organization.list_all_employees!(),
         block_labels: block_labels(workflows),
-        filters: @no_filters
+        filters: @no_filters,
+        task_groups: Board.list_task_groups!(),
+        new_group?: false
       )
       |> show_tasks()
       |> allow_upload(:attachments,
@@ -86,6 +91,7 @@ defmodule WeworkaiWeb.BoardLive do
         |> assign(
           page_title: task.title,
           form: nil,
+          new_group?: false,
           details_form: to_form(Board.form_to_update_task(task)),
           attachments: Board.list_attachments!(task.id)
         )
@@ -100,11 +106,12 @@ defmodule WeworkaiWeb.BoardLive do
 
   @impl true
   def handle_event("validate", %{"form" => params}, socket) do
-    {:noreply, assign(socket, form: AshPhoenix.Form.validate(socket.assigns.form, params))}
+    {:noreply,
+     assign(socket, form: AshPhoenix.Form.validate(socket.assigns.form, tag_params(params)))}
   end
 
   def handle_event("create", %{"form" => params}, socket) do
-    case AshPhoenix.Form.submit(socket.assigns.form, params: params) do
+    case AshPhoenix.Form.submit(socket.assigns.form, params: tag_params(params)) do
       {:ok, task} ->
         {:noreply,
          socket
@@ -135,6 +142,41 @@ defmodule WeworkaiWeb.BoardLive do
     end
   end
 
+  # A stack dragged to another column, confirmed in the browser: each of the group's tasks
+  # shown in the column it left moves as if dragged alone; refusals are told, not fatal.
+  def handle_event(
+        "move_group",
+        %{"group_id" => group_id, "from" => from, "status" => status},
+        socket
+      ) do
+    tasks =
+      socket.assigns.members
+      |> Map.get(group_id, %{})
+      |> Map.values()
+      |> Enum.filter(&(to_string(&1.status) == from))
+
+    {socket, refused} =
+      Enum.reduce(tasks, {socket, []}, fn task, {socket, refused} ->
+        with {:ok, task} <- Board.get_task(task.id),
+             {:ok, moved} <- Board.move_task(task, status) do
+          {place_task(socket, moved), refused}
+        else
+          {:error, error} -> {socket, [move_error(error) | refused]}
+        end
+      end)
+
+    socket = flush_stacks(socket)
+
+    case refused do
+      [] ->
+        {:noreply, put_flash(socket, :info, "Moved #{length(tasks)} tasks.")}
+
+      [reason | _] ->
+        moved = length(tasks) - length(refused)
+        {:noreply, put_flash(socket, :error, "Moved #{moved} of #{length(tasks)}. #{reason}")}
+    end
+  end
+
   def handle_event("continue", %{"id" => id, "target" => target}, socket) do
     with {:ok, task} <- Board.get_task(id),
          {:ok, continued} <- Board.continue_task(task, target) do
@@ -146,7 +188,7 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   def handle_event("save_details", %{"form" => params}, socket) do
-    case AshPhoenix.Form.submit(socket.assigns.details_form, params: params) do
+    case AshPhoenix.Form.submit(socket.assigns.details_form, params: tag_params(params)) do
       {:ok, task} ->
         {:noreply,
          socket
@@ -158,12 +200,50 @@ defmodule WeworkaiWeb.BoardLive do
     end
   end
 
+  # The drawer's group control: none, an existing group, or a new one named next.
+  def handle_event("group", %{"group_id" => "new"}, socket),
+    do: {:noreply, assign(socket, new_group?: true)}
+
+  def handle_event("group", %{"task_id" => id, "group_id" => group_id}, socket) do
+    with {:ok, task} <- Board.get_task(id),
+         {:ok, grouped} <- Board.group_task(task, if(group_id != "", do: group_id)) do
+      {:noreply, socket |> place(grouped) |> refresh_groups()}
+    else
+      {:error, error} ->
+        {:noreply, put_flash(socket, :error, "Not grouped: #{ErrorText.readable(error)}.")}
+    end
+  end
+
+  def handle_event("create_group", %{"task_id" => id, "name" => name}, socket) do
+    with {:ok, task} <- Board.get_task(id),
+         {:ok, group} <- Board.create_task_group(name),
+         {:ok, grouped} <- Board.group_task(task, group.id) do
+      {:noreply, socket |> place(grouped) |> refresh_groups()}
+    else
+      {:error, error} ->
+        {:noreply, put_flash(socket, :error, "Not grouped: #{ErrorText.readable(error)}.")}
+    end
+  end
+
+  # A stack's Ungroup: every task of the group back on its own; the group goes with the last.
+  def handle_event("ungroup", %{"id" => group_id}, socket) do
+    socket =
+      [query: [filter: [group_id: group_id]]]
+      |> Board.list_tasks!()
+      |> Enum.reduce(socket, &place_task(&2, Board.group_task!(&1, nil)))
+      |> flush_stacks()
+
+    {:noreply, socket |> refresh_groups() |> put_flash(:info, "Ungrouped.")}
+  end
+
   def handle_event("delete", %{"id" => id}, socket) do
     with {:ok, task} <- Board.get_task(id),
          :ok <- Board.destroy_task(task) do
       {:noreply,
        socket
        |> stream_delete(task.status, task)
+       |> regroup(task.id, nil, [task.status])
+       |> flush_stacks()
        |> update(:placements, &Map.delete(&1, task.id))
        |> update(:working, &Map.delete(&1, task.id))
        |> update(:shown, &MapSet.delete(&1, task.id))
@@ -189,8 +269,11 @@ defmodule WeworkaiWeb.BoardLive do
   @impl true
   def handle_info({:task_updated, %{id: id}}, socket) do
     case Board.get_task(id) do
-      {:ok, task} -> {:noreply, socket |> place(task) |> replace(related(task))}
-      {:error, _} -> {:noreply, socket}
+      {:ok, task} ->
+        {:noreply, socket |> place_task(task) |> replace(related(task)) |> flush_stacks()}
+
+      {:error, _} ->
+        {:noreply, socket}
     end
   end
 
@@ -200,6 +283,8 @@ defmodule WeworkaiWeb.BoardLive do
         {:ok, status} ->
           socket
           |> stream_delete(status, task)
+          |> regroup(task.id, nil, [status])
+          |> flush_stacks()
           |> update(:placements, &Map.delete(&1, task.id))
           |> update(:working, &Map.delete(&1, task.id))
           |> update(:shown, &MapSet.delete(&1, task.id))
@@ -218,7 +303,11 @@ defmodule WeworkaiWeb.BoardLive do
   # Idempotent, so a change this view made itself and then hears about again is harmless.
   # Actions return the task without its activity, which the card shows. A task the filters
   # no longer let through leaves the board.
-  defp place(socket, task) do
+  defp place(socket, task), do: socket |> place_task(task) |> flush_stacks()
+
+  # As place/2, leaving the stacks it changed to be drawn once the event is done
+  # (`flush_stacks/1`): a stream item inserted and then deleted in one render stays.
+  defp place_task(socket, task) do
     task =
       task
       |> Ash.load!(:activity, lazy?: true)
@@ -226,14 +315,18 @@ defmodule WeworkaiWeb.BoardLive do
         [:current_node, :open_blocker_titles, :dependent_ids, :child_count, :done_child_count],
         lazy?: true
       )
+      # Not lazily: the task may have just changed group.
+      |> Ash.load!([:cron, :group])
 
     previous = socket.assigns.placements[task.id]
 
     socket
     |> then(&if(previous in [nil, task.status], do: &1, else: stream_delete(&1, previous, task)))
     |> show_card(task)
+    |> regroup(task.id, task, [previous, task.status])
     |> update(:placements, &Map.put(&1, task.id, task.status))
     |> update(:working, &track_working(&1, task))
+    |> update(:tag_options, &Enum.sort(Enum.uniq(&1 ++ task.tags)))
     |> then(
       &if(&1.assigns.task && &1.assigns.task.id == task.id,
         do: assign_drawer_task(&1, task),
@@ -248,39 +341,146 @@ defmodule WeworkaiWeb.BoardLive do
   defp replace(socket, ids) do
     ids
     |> Enum.filter(&Map.has_key?(socket.assigns.placements, &1))
-    |> Enum.reduce(socket, fn id, socket -> place(socket, Board.get_task!(id)) end)
+    |> Enum.reduce(socket, fn id, socket -> place_task(socket, Board.get_task!(id)) end)
   end
 
+  # A grouped card shows in its group's stack (`regroup/4`), not on its own; both count.
   defp show_card(socket, task) do
-    if matches?(task, socket.assigns.filters) do
-      socket |> stream_insert(task.status, task) |> update(:shown, &MapSet.put(&1, task.id))
-    else
-      socket |> stream_delete(task.status, task) |> update(:shown, &MapSet.delete(&1, task.id))
+    shown? = matches?(task, socket.assigns.filters)
+
+    socket
+    |> then(
+      &if(shown? and is_nil(task.group_id),
+        do: stream_insert(&1, task.status, task),
+        else: stream_delete(&1, task.status, task)
+      )
+    )
+    |> update(:shown, &if(shown?, do: MapSet.put(&1, task.id), else: MapSet.delete(&1, task.id)))
+  end
+
+  defp refresh_groups(socket),
+    do: assign(socket, task_groups: Board.list_task_groups!(), new_group?: false)
+
+  # The stacks the task was and is in are to be drawn again (`flush_stacks/1`), in the
+  # columns it was and is in. `task` nil: it was deleted.
+  defp regroup(socket, task_id, task, statuses) do
+    was = socket.assigns.member_of[task_id]
+    now = if task && task.group_id && matches?(task, socket.assigns.filters), do: task.group_id
+
+    members =
+      socket.assigns.members
+      |> drop_member(was, task_id)
+      |> then(
+        &if(now,
+          do:
+            Map.update(&1, now, %{task_id => task}, fn tasks -> Map.put(tasks, task_id, task) end),
+          else: &1
+        )
+      )
+
+    member_of =
+      if now,
+        do: Map.put(socket.assigns.member_of, task_id, now),
+        else: Map.delete(socket.assigns.member_of, task_id)
+
+    stale =
+      for group_id <- [was, now],
+          status <- statuses,
+          group_id && status,
+          into: socket.assigns.stale_stacks,
+          do: {group_id, status}
+
+    assign(socket, members: members, member_of: member_of, stale_stacks: stale)
+  end
+
+  defp flush_stacks(socket) do
+    socket.assigns.stale_stacks
+    |> Enum.reduce(socket, fn {group_id, status}, socket -> restack(socket, group_id, status) end)
+    |> assign(stale_stacks: MapSet.new())
+  end
+
+  defp drop_member(members, nil, _task_id), do: members
+
+  defp drop_member(members, group_id, task_id) do
+    tasks = members |> Map.get(group_id, %{}) |> Map.delete(task_id)
+    if tasks == %{}, do: Map.delete(members, group_id), else: Map.put(members, group_id, tasks)
+  end
+
+  defp restack(socket, group_id, status) do
+    name = group_stream(status)
+    tasks = socket.assigns.members |> Map.get(group_id, %{}) |> Map.values()
+
+    case stack(group_id, status, tasks) do
+      nil -> stream_delete_by_dom_id(socket, name, "#{name}-#{group_id}-#{status}")
+      stack -> stream_insert(socket, name, stack)
     end
   end
+
+  # A group's cards in one column, newest first; nil when it has none there.
+  defp stack(group_id, status, tasks) do
+    case tasks
+         |> Enum.filter(&(&1.status == status))
+         |> Enum.sort_by(&(&1.cron_run_at || &1.inserted_at), {:desc, DateTime}) do
+      [] ->
+        nil
+
+      [newest | _] = tasks ->
+        %{id: "#{group_id}-#{status}", group: newest.group, status: status, tasks: tasks}
+    end
+  end
+
+  defp stacks(members, status) do
+    for {group_id, tasks} <- members,
+        stack = stack(group_id, status, Map.values(tasks)),
+        stack != nil,
+        do: stack
+  end
+
+  defp group_stream(status), do: Map.fetch!(@group_streams, status)
 
   # Fills every column afresh with the tasks the filters let through. placements and
   # working keep every task: moves need the old column, the "Needs you" banner counts all.
   defp show_tasks(socket) do
     tasks = Board.list_tasks!()
     shown = Enum.filter(tasks, &matches?(&1, socket.assigns.filters))
-    by_status = Enum.group_by(shown, & &1.status)
+    {grouped, loose} = Enum.split_with(shown, & &1.group_id)
+    by_status = Enum.group_by(loose, & &1.status)
+
+    members =
+      grouped
+      |> Enum.group_by(& &1.group_id)
+      |> Map.new(fn {group_id, tasks} -> {group_id, Map.new(tasks, &{&1.id, &1})} end)
 
     socket.assigns.statuses
     |> Enum.reduce(socket, &stream(&2, &1, Map.get(by_status, &1, []), reset: true))
+    |> then(fn socket ->
+      Enum.reduce(
+        socket.assigns.statuses,
+        socket,
+        &stream(&2, group_stream(&1), stacks(members, &1), reset: true)
+      )
+    end)
     |> assign(
       # The column each card is in; streams don't remember, and moves need the old column.
       placements: Map.new(tasks, &{&1.id, &1.status}),
       # Whether an agent runs or is queued on each card it works on, for the columns' counts.
       working: Map.new(Enum.filter(tasks, & &1.activity), &{&1.id, &1.activity.state}),
-      shown: MapSet.new(shown, & &1.id)
+      shown: MapSet.new(shown, & &1.id),
+      # The grouped cards shown, by group, and each one's group: what the stacks hold.
+      members: members,
+      member_of: Map.new(grouped, &{&1.id, &1.group_id}),
+      # Stacks a change left to draw again (`flush_stacks/1`).
+      stale_stacks: MapSet.new(),
+      # Every tag in use, for the tag filter.
+      tag_options: tasks |> Enum.flat_map(& &1.tags) |> Enum.uniq() |> Enum.sort()
     )
   end
 
   defp matches?(task, filters) do
     text?(task, filters["q"]) and filters["workflow"] in ["", task.workflow_id] and
       assignee?(filters["assignee"], task.assignee_id) and
-      block?(filters["block"], task.current_node)
+      block?(filters["block"], task.current_node) and
+      (filters["tag"] == "" or filters["tag"] in task.tags)
   end
 
   defp text?(task, query) do
@@ -299,6 +499,23 @@ defmodule WeworkaiWeb.BoardLive do
   defp block?(_label, _node), do: false
 
   defp filtering?(filters), do: filters != @no_filters
+
+  # Tags are typed as one comma-separated line: "gitlab, daily".
+  defp tag_params(%{"tags" => tags} = params) when is_binary(tags) do
+    tags =
+      tags
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq_by(&String.downcase/1)
+
+    %{params | "tags" => tags}
+  end
+
+  defp tag_params(params), do: params
+
+  defp tags_text(tags) when is_list(tags), do: Enum.join(tags, ", ")
+  defp tags_text(text), do: text || ""
 
   # Labels of the blocks a task can sit on, across workflows: "Code review" finds a task on
   # such a block whichever workflow it runs.
@@ -531,6 +748,16 @@ defmodule WeworkaiWeb.BoardLive do
           <option value="">Any block</option>
           {Phoenix.HTML.Form.options_for_select(@block_labels, @filters["block"])}
         </select>
+        <select
+          :if={@tag_options != []}
+          id="board-filter-tag"
+          name="filter[tag]"
+          aria-label="Tag"
+          class="select select-sm w-36"
+        >
+          <option value="">Any tag</option>
+          {Phoenix.HTML.Form.options_for_select(@tag_options, @filters["tag"])}
+        </select>
         <button
           :if={filtering?(@filters)}
           id="board-filters-clear"
@@ -548,7 +775,7 @@ defmodule WeworkaiWeb.BoardLive do
           id={"board-column-#{status}"}
           data-status={status}
           aria-label={Status.label(status)}
-          class="board-lane w-72 shrink-0"
+          class="board-lane group/lane w-72 shrink-0"
         >
           <header class="flex h-9 items-center gap-2 border-b border-dashed border-(--orpheus-border) px-2.5">
             <span
@@ -572,10 +799,22 @@ defmodule WeworkaiWeb.BoardLive do
             </span>
           </header>
 
+          <div
+            id={"column-#{status}-groups"}
+            phx-update="stream"
+            class="flex flex-col gap-2 has-[[data-group-card]]:px-2 has-[[data-group-card]]:pt-2"
+          >
+            <.task_stack
+              :for={{id, stack} <- @streams[group_stream(status)]}
+              id={id}
+              stack={stack}
+            />
+          </div>
+
           <div id={"column-#{status}"} phx-update="stream" class="flex min-h-12 flex-col gap-2 p-2">
             <p
               id={"column-#{status}-empty"}
-              class="micro-label hidden border border-dashed border-(--orpheus-border) px-3 py-5 text-center only:block"
+              class="micro-label hidden border border-dashed border-(--orpheus-border) px-3 py-5 text-center only:block group-has-[[data-group-card]]/lane:hidden!"
             >
               {if filtering?(@filters), do: "[ No matching tasks ]", else: "[ No tasks ]"}
             </p>
@@ -620,6 +859,19 @@ defmodule WeworkaiWeb.BoardLive do
                   />
                 </div>
                 <p class="text-[13px] leading-snug font-medium break-words">{task.title}</p>
+                <div
+                  :if={task.tags != [] or task.cron_run_at}
+                  id={"task-#{task.id}-tags"}
+                  class="mt-1.5 flex flex-wrap items-center gap-1"
+                >
+                  <.task_tag :for={tag <- task.tags} tag={tag} />
+                  <.cron_time
+                    :if={task.cron_run_at}
+                    id={"task-#{task.id}-cron-time"}
+                    at={task.cron_run_at}
+                    timezone={task.cron && task.cron.timezone}
+                  />
+                </div>
                 <p
                   :if={task.description}
                   class="mt-1 line-clamp-2 break-words text-(--orpheus-text-muted)"
@@ -663,11 +915,17 @@ defmodule WeworkaiWeb.BoardLive do
               this.el.querySelectorAll("[data-over]").forEach((el) => el.removeAttribute("data-over"))
 
             this.el.addEventListener("dragstart", (event) => {
-              const card = event.target.closest("[data-task-id]")
+              // A stack's member row is nearer than its stack, so it drags alone.
+              const card = event.target.closest("[data-task-id], [data-group-id]")
               source = columnAt(card)
+              this.dragged = card
               card.setAttribute("data-dragging", "")
               event.dataTransfer.effectAllowed = "move"
-              event.dataTransfer.setData("text/plain", card.dataset.taskId)
+              if (card.dataset.taskId) {
+                event.dataTransfer.setData("text/plain", card.dataset.taskId)
+              } else {
+                event.dataTransfer.setData("application/x-weworkai-group", card.dataset.groupId)
+              }
             })
 
             this.el.addEventListener("dragover", (event) => {
@@ -686,6 +944,19 @@ defmodule WeworkaiWeb.BoardLive do
               event.preventDefault()
               clearHighlight()
               if (column === source) return
+              // A whole stack: every task of the group in this column moves, once confirmed.
+              const group = event.dataTransfer.getData("application/x-weworkai-group")
+              if (group) {
+                const {count, name} = this.dragged.dataset
+                const to = column.getAttribute("aria-label")
+                if (!window.confirm(`Move all ${count} tasks of “${name}” to ${to}?`)) return
+                this.pushEvent("move_group", {
+                  group_id: group,
+                  from: source.dataset.status,
+                  status: column.dataset.status,
+                })
+                return
+              }
               this.pushEvent("move", {
                 task_id: event.dataTransfer.getData("text/plain"),
                 status: column.dataset.status,
@@ -694,7 +965,7 @@ defmodule WeworkaiWeb.BoardLive do
 
             this.el.addEventListener("dragend", (event) => {
               clearHighlight()
-              event.target.closest("[data-task-id]")?.removeAttribute("data-dragging")
+              event.target.closest("[data-task-id], [data-group-id]")?.removeAttribute("data-dragging")
             })
           },
         }
@@ -882,6 +1153,76 @@ defmodule WeworkaiWeb.BoardLive do
             </dd>
             <dt :if={@task.stage} class="micro-label">Stage</dt>
             <dd :if={@task.stage}><.stage_badge stage={@task.stage} /></dd>
+            <dt class="micro-label">Tags</dt>
+            <dd>
+              <.form
+                for={@details_form}
+                id="task-drawer-tags-form"
+                phx-change="save_details"
+                phx-submit="save_details"
+                phx-auto-recover="ignore"
+              >
+                <input
+                  id="task-drawer-tags"
+                  name={@details_form[:tags].name}
+                  value={tags_text(@details_form[:tags].value)}
+                  aria-label="Tags"
+                  placeholder="e.g. gitlab, daily"
+                  phx-debounce="blur"
+                  class="input input-sm w-56"
+                />
+              </.form>
+            </dd>
+            <dt :if={@task.cron_run_at} class="micro-label">Scheduled</dt>
+            <dd :if={@task.cron_run_at} id="task-drawer-cron" class="flex items-center gap-2">
+              <.cron_time at={@task.cron_run_at} timezone={@task.cron && @task.cron.timezone} />
+              <.link
+                :if={@task.cron}
+                navigate={~p"/recurring"}
+                class="text-xs transition-colors hover:text-primary"
+              >
+                {@task.cron.name}
+              </.link>
+            </dd>
+            <dt class="micro-label">Group</dt>
+            <dd>
+              <form id="task-drawer-group" phx-change="group" phx-auto-recover="ignore">
+                <input type="hidden" name="task_id" value={@task.id} />
+                <select
+                  id="task-drawer-group-select"
+                  name="group_id"
+                  aria-label="Group"
+                  title="Grouped tasks show as one stack per column on the board"
+                  class="select select-sm w-56"
+                >
+                  <option value="">No group</option>
+                  {Phoenix.HTML.Form.options_for_select(
+                    Enum.map(@task_groups, &{&1.name, &1.id}),
+                    !@new_group? && @task.group_id
+                  )}
+                  <option value="new" selected={@new_group?}>New group…</option>
+                </select>
+              </form>
+              <form
+                :if={@new_group?}
+                id="task-drawer-new-group"
+                phx-submit="create_group"
+                class="mt-2 flex items-center gap-2"
+              >
+                <input type="hidden" name="task_id" value={@task.id} />
+                <input
+                  id="task-drawer-new-group-name"
+                  name="name"
+                  aria-label="New group's name"
+                  placeholder="e.g. Release 2.3"
+                  phx-mounted={JS.focus()}
+                  class="input input-sm w-44"
+                />
+                <button type="submit" class="btn btn-primary btn-xs" phx-disable-with="Creating…">
+                  Create
+                </button>
+              </form>
+            </dd>
             <dt class="micro-label">Created</dt>
             <dd>{Calendar.strftime(@task.inserted_at, "%B %-d, %Y %H:%M")}</dd>
             <dt class="micro-label">Last edited</dt>
@@ -983,6 +1324,13 @@ defmodule WeworkaiWeb.BoardLive do
             label="Repository"
           />
           <.input
+            field={@form[:tags]}
+            id="task-form-tags"
+            value={tags_text(@form[:tags].value)}
+            label="Tags"
+            placeholder="e.g. gitlab, daily (comma-separated)"
+          />
+          <.input
             field={@form[:workflow_id]}
             type="select"
             label="Workflow"
@@ -1007,6 +1355,126 @@ defmodule WeworkaiWeb.BoardLive do
       </.modal>
     </Layouts.app>
     """
+  end
+
+  attr :id, :string, required: true
+  attr :stack, :map, required: true
+
+  # A group's cards in one column as one stack: its name, how many, and for a cron's the
+  # span of its runs. Dragged whole it moves them all (after a confirm); opened, it lists
+  # them, each one draggable and openable on its own.
+  defp task_stack(assigns) do
+    assigns =
+      assign(assigns,
+        group: assigns.stack.group,
+        tasks: assigns.stack.tasks,
+        span: span(assigns.stack)
+      )
+
+    ~H"""
+    <article
+      id={@id}
+      data-group-card
+      data-open="false"
+      draggable="true"
+      data-group-id={@group.id}
+      data-count={length(@tasks)}
+      data-name={@group.name}
+      class={[
+        "board-stack orpheus-card group/stack cursor-grab text-xs active:cursor-grabbing",
+        @group.cron_id && "board-stack-cron"
+      ]}
+    >
+      <button
+        id={"#{@id}-toggle"}
+        type="button"
+        phx-click={JS.toggle_attribute({"data-open", "true", "false"}, to: "##{@id}")}
+        aria-label={"Show the #{length(@tasks)} tasks of #{@group.name}"}
+        class="flex w-full items-start gap-2 px-2.5 py-2 text-left"
+      >
+        <.icon name="hero-square-3-stack-3d-micro" class="mt-0.5 size-4 shrink-0 text-primary" />
+        <span class="min-w-0 flex-1">
+          <span class="block text-[13px] leading-snug font-medium break-words">{@group.name}</span>
+          <span class="mt-1.5 flex flex-wrap items-center gap-1">
+            <span id={"#{@id}-count"} class="orpheus-badge tone-violet tabular-nums">
+              ×{length(@tasks)}
+            </span>
+            <.task_tag :if={@group.cron_id} tag={Task.cron_tag()} />
+            <span
+              :if={@span}
+              id={"#{@id}-span"}
+              class="inline-flex items-center gap-1 font-mono text-[11px] text-(--orpheus-text-muted)"
+            >
+              <.icon name="hero-clock-micro" class="size-3" /> {@span}
+            </span>
+            <.needs_you
+              :if={Enum.any?(@tasks, &(&1.status == :await_human_supervision))}
+              id={"#{@id}-needs-you"}
+            />
+          </span>
+        </span>
+        <.icon
+          name="hero-chevron-down-micro"
+          class="size-4 shrink-0 text-(--orpheus-text-muted) transition-transform group-data-[open=true]/stack:rotate-180"
+        />
+      </button>
+      <ul
+        id={"#{@id}-tasks"}
+        class="hidden space-y-0.5 border-t border-dashed border-(--orpheus-border) px-1.5 py-1.5 group-data-[open=true]/stack:block"
+      >
+        <li
+          :for={task <- @tasks}
+          id={"#{@id}-task-#{task.id}"}
+          draggable="true"
+          data-task-id={task.id}
+          class="board-stack-item cursor-grab rounded px-1.5 py-1 transition-colors hover:bg-(--orpheus-hover) active:cursor-grabbing"
+        >
+          <.link
+            id={"task-link-#{task.id}"}
+            {card_link(task)}
+            draggable="false"
+            class="flex items-center gap-2"
+          >
+            <span class="min-w-0 flex-1 truncate">{task.title}</span>
+            <.cron_time
+              :if={task.cron_run_at}
+              at={task.cron_run_at}
+              timezone={task.cron && task.cron.timezone}
+            />
+          </.link>
+        </li>
+        <li class="pt-1">
+          <button
+            id={"#{@id}-ungroup"}
+            type="button"
+            phx-click="ungroup"
+            phx-value-id={@group.id}
+            data-confirm={"Ungroup #{@group.name}? Its tasks go back on the board one by one."}
+            class="btn btn-ghost btn-xs w-full"
+          >
+            <.icon name="hero-squares-2x2-micro" class="size-3.5" /> Ungroup
+          </button>
+        </li>
+      </ul>
+    </article>
+    """
+  end
+
+  # A cron group's first and last run time on its clock: "08:00–14:30".
+  defp span(%{group: %{cron_id: nil}}), do: nil
+
+  defp span(%{tasks: tasks}) do
+    timezone = Enum.find_value(tasks, &(&1.cron && &1.cron.timezone)) || "Etc/UTC"
+    clock = &(&1 |> DateTime.shift_zone!(timezone) |> Calendar.strftime("%H:%M"))
+
+    case tasks |> Enum.map(& &1.cron_run_at) |> Enum.reject(&is_nil/1) do
+      [] ->
+        nil
+
+      times ->
+        {first, last} = {clock.(Enum.min(times, DateTime)), clock.(Enum.max(times, DateTime))}
+        if first == last, do: first, else: "#{first}–#{last}"
+    end
   end
 
   attr :upload, Phoenix.LiveView.UploadConfig, required: true
