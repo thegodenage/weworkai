@@ -337,11 +337,7 @@ defmodule WeworkaiWeb.BoardLiveTest do
       # Created after this board mounted, as another tab would.
       lean = Weworkai.Workflows.create_workflow!("Lean")
 
-      browser_remembers(
-        view,
-        %{"repository" => "~/Projects/app", "workflow_id" => lean.id},
-        false
-      )
+      browser_remembers(view, %{"repository" => "~/Projects/app", "workflow_id" => lean.id})
 
       render_patch(view, ~p"/tasks/new")
 
@@ -353,6 +349,25 @@ defmodule WeworkaiWeb.BoardLiveTest do
       assert has_element?(
                view,
                "#task-form select[name='form[workflow_id]'] option[selected][value='#{lean.id}']"
+             )
+    end
+
+    test "a draft the user has begun is kept when the defaults arrive", %{conn: conn} do
+      lean = Weworkai.Workflows.create_workflow!("Lean")
+      {:ok, view, _html} = live(conn, ~p"/tasks/new")
+
+      # A reconnect's form recovery validates the draft before the hook sends the defaults.
+      view
+      |> form("#task-form", form: %{title: "Draft", repository: "~/Projects/typed"})
+      |> render_change()
+
+      browser_remembers(view, %{"repository" => "~/Projects/app", "workflow_id" => lean.id})
+
+      assert has_element?(view, "#task-form input[name='form[title]'][value='Draft']")
+
+      assert has_element?(
+               view,
+               "#task-form input[name='form[repository]'][value='~/Projects/typed']"
              )
     end
 
@@ -375,6 +390,7 @@ defmodule WeworkaiWeb.BoardLiveTest do
 
       assert has_element?(view, "#task-form input[name='form[title]'][value='Kept']")
       assert has_element?(view, "#task-form", "no longer exists")
+      refute has_element?(view, "#task-form option[value='#{lean.id}']")
       refute Enum.any?(Board.list_tasks!(), &(&1.title == "Kept"))
     end
 
@@ -409,10 +425,10 @@ defmodule WeworkaiWeb.BoardLiveTest do
   end
 
   # What the TaskDefaults hook (assets/js/app.js) sends from localStorage.
-  defp browser_remembers(view, task_defaults, initial \\ true) do
+  defp browser_remembers(view, task_defaults) do
     view
     |> element("#task-defaults")
-    |> render_hook("remembered", %{"task_defaults" => task_defaults, "initial" => initial})
+    |> render_hook("remembered", %{"task_defaults" => task_defaults})
   end
 
   defp unconfigured_planner do

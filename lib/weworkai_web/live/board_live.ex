@@ -29,7 +29,8 @@ defmodule WeworkaiWeb.BoardLive do
         employees: Organization.list_all_employees!(),
         block_labels: block_labels(workflows),
         filters: @no_filters,
-        remembered: %{}
+        remembered: %{},
+        form_touched?: false
       )
       |> show_tasks()
       |> allow_upload(:attachments,
@@ -69,6 +70,7 @@ defmodule WeworkaiWeb.BoardLive do
     assign(socket,
       page_title: "New task",
       form: new_task_form(socket.assigns),
+      form_touched?: false,
       task: nil,
       details_form: nil,
       continue_targets: [],
@@ -129,13 +131,15 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   @impl true
-  # From the TaskDefaults hook (assets/js/app.js). The first arrives just after connecting,
-  # so a New form opened by loading /tasks/new still starts from them.
+  # From the TaskDefaults hook (assets/js/app.js), just after connecting and whenever
+  # another tab creates a task. A New form already open (/tasks/new loaded or navigated to)
+  # starts over from them, unless the user has begun on it: a reconnect's form recovery
+  # validates first, so it keeps the draft.
   def handle_event("remembered", params, socket) do
     socket = assign(socket, remembered: remembered(params))
 
     socket =
-      if params["initial"] && socket.assigns.live_action == :new,
+      if socket.assigns.live_action == :new and not socket.assigns.form_touched?,
         do: assign(socket, form: new_task_form(socket.assigns)),
         else: socket
 
@@ -143,7 +147,11 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   def handle_event("validate", %{"form" => params}, socket) do
-    {:noreply, assign(socket, form: AshPhoenix.Form.validate(socket.assigns.form, params))}
+    {:noreply,
+     assign(socket,
+       form: AshPhoenix.Form.validate(socket.assigns.form, params),
+       form_touched?: true
+     )}
   end
 
   def handle_event("create", %{"form" => params}, socket) do
@@ -157,8 +165,9 @@ defmodule WeworkaiWeb.BoardLive do
          |> remember(task)
          |> push_patch(to: ~p"/")}
 
+      # Fresh workflows, so one deleted since the form opened is no longer offered.
       {:error, form} ->
-        {:noreply, assign(socket, form: form)}
+        {:noreply, assign(socket, form: form, form_workflows: Workflows.list_workflows!())}
     end
   end
 

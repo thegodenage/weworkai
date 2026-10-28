@@ -46,24 +46,25 @@ window.addEventListener("phx:remember-task-defaults", ({detail}) => {
 })
 
 // Hands the board the stored defaults over its channel (not the socket URL, which a long
-// repository would push past the server's limit): on connect, and whenever another tab
-// creates a task, so it neither starts from nor later writes back older ones.
+// repository would push past the server's limit): on connect and reconnect (a fresh
+// LiveView process), and whenever another tab creates a task, so it neither starts from
+// nor later writes back older ones.
 const TaskDefaults = {
   mounted() {
-    this.send(true)
-    this.onStorage = ({key}) => key === TASK_DEFAULTS_KEY && this.send(false)
+    this.send()
+    this.onStorage = ({key}) => key === TASK_DEFAULTS_KEY && this.send()
     window.addEventListener("storage", this.onStorage)
   },
   reconnected() {
-    this.send(true)
+    this.send()
   },
   destroyed() {
     window.removeEventListener("storage", this.onStorage)
   },
-  send(initial) {
+  send() {
     // Rejected while disconnected; it hears them on reconnect instead.
     Promise.resolve()
-      .then(() => this.pushEvent("remembered", {task_defaults: taskDefaults(), initial}))
+      .then(() => this.pushEvent("remembered", {task_defaults: taskDefaults()}))
       .catch(() => {})
   },
 }
