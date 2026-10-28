@@ -60,6 +60,8 @@ defmodule Weworkai.Recurring.RunnerTest do
                {:error, "is not a valid cron expression"}
 
       assert Runner.check_expression("0 0 30 2 *") == {:error, "never runs"}
+      assert Runner.check_expression("@reboot") == {:error, "@reboot is not supported"}
+      assert Runner.preview("@reboot", "Etc/UTC") == {:error, "@reboot is not supported"}
     end
   end
 
@@ -151,6 +153,31 @@ defmodule Weworkai.Recurring.RunnerTest do
     assert task.cron_run_at == ~U[2026-11-02 11:00:00.000000Z]
     assert task.title == "Check comments · Mon 02 Nov 11:00"
     assert Recurring.get_cron!(cron.id).last_skipped_at == ~U[2026-11-02 08:00:00.000000Z]
+  end
+
+  test "after an outage a frequent cron fires the newest slot within the window" do
+    cron = cron!(human_workflow!(), %{mode: :expression, expression: "*/5 * * * *"})
+    due_at!(cron, ~U[2026-11-02 08:00:00Z])
+    now = ~U[2026-11-02 11:10:00Z]
+
+    for _tick <- 1..3, do: :ok = Runner.start_due(now)
+
+    [task] = Board.list_tasks!()
+    assert task.cron_run_at == ~U[2026-11-02 11:10:00.000000Z]
+    assert task.title == "Check comments · Mon 02 Nov 11:10"
+  end
+
+  test "a missed slot stays recorded through the catch-up run, and clears at the next" do
+    cron = cron!(human_workflow!(), %{mode: :expression, expression: "0 * * * *"})
+    due_at!(cron, ~U[2026-11-02 08:00:00Z])
+
+    :ok = Runner.start_due(~U[2026-11-02 11:10:00Z])
+    :ok = Runner.start_due(~U[2026-11-02 11:10:01Z])
+    assert Recurring.get_cron!(cron.id).last_skipped_at == ~U[2026-11-02 08:00:00.000000Z]
+
+    :ok = Runner.start_due(~U[2026-11-02 12:00:30Z])
+    assert Recurring.get_cron!(cron.id).last_skipped_at == nil
+    assert length(Board.list_tasks!()) == 2
   end
 
   test "runs close together share the cron's group; the first joins it" do

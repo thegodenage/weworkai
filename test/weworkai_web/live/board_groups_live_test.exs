@@ -46,6 +46,15 @@ defmodule WeworkaiWeb.BoardGroupsLiveTest do
       refute has_element?(view, "#backlog-#{task.id}")
       assert has_element?(view, "#{stack(group, :backlog)} #task-link-#{task.id}")
     end
+
+    # The runner made the group: the drawer offers it, picked.
+    [task | _] = Board.list_tasks!()
+    render_patch(view, ~p"/tasks/#{task.id}/edit")
+
+    assert has_element?(
+             view,
+             ~s|#task-drawer-group-select option[value="#{group.id}"][selected]|
+           )
   end
 
   test "tasks are grouped from the drawer and ungrouped from their stack", %{conn: conn} do

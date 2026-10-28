@@ -92,6 +92,8 @@ defmodule WeworkaiWeb.BoardLive do
           page_title: task.title,
           form: nil,
           new_group?: false,
+          # Crons and other boards make and drop groups too.
+          task_groups: Board.list_task_groups!(),
           details_form: to_form(Board.form_to_update_task(task)),
           attachments: Board.list_attachments!(task.id)
         )
@@ -270,7 +272,12 @@ defmodule WeworkaiWeb.BoardLive do
   def handle_info({:task_updated, %{id: id}}, socket) do
     case Board.get_task(id) do
       {:ok, task} ->
-        {:noreply, socket |> place_task(task) |> replace(related(task)) |> flush_stacks()}
+        {:noreply,
+         socket
+         |> know_group(task)
+         |> place_task(task)
+         |> replace(related(task))
+         |> flush_stacks()}
 
       {:error, _} ->
         {:noreply, socket}
@@ -356,6 +363,15 @@ defmodule WeworkaiWeb.BoardLive do
       )
     )
     |> update(:shown, &if(shown?, do: MapSet.put(&1, task.id), else: MapSet.delete(&1, task.id)))
+  end
+
+  # A group made elsewhere (a cron's runs) joins the drawer's choices.
+  defp know_group(socket, %{group_id: nil}), do: socket
+
+  defp know_group(socket, task) do
+    if Enum.any?(socket.assigns.task_groups, &(&1.id == task.group_id)),
+      do: socket,
+      else: assign(socket, task_groups: Board.list_task_groups!())
   end
 
   defp refresh_groups(socket),

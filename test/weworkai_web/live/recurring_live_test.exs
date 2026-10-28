@@ -85,6 +85,32 @@ defmodule WeworkaiWeb.RecurringLiveTest do
     assert has_element?(view, "#cron-#{cron.id}-when", "*/30 8-18 * * * (Europe/Warsaw)")
   end
 
+  test "a slot missed in an outage is shown after the catch-up run", %{conn: conn} do
+    cron =
+      Recurring.create_cron!(%{
+        name: "Hourly",
+        workflow_id: Workflows.default_workflow!().id,
+        mode: :expression,
+        expression: "0 * * * *"
+      })
+
+    Recurring.claim_cron!(cron, %{next_run_at: ~U[2026-11-02 08:00:00Z]})
+    :ok = Weworkai.Recurring.Runner.start_due(~U[2026-11-02 11:10:00Z])
+    :ok = Weworkai.Recurring.Runner.start_due(~U[2026-11-02 11:10:01Z])
+
+    {:ok, view, _html} = live(conn, ~p"/recurring")
+    assert has_element?(view, "#cron-#{cron.id}-skipped")
+  end
+
+  test "@reboot is refused, not crashed on", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/recurring/new")
+    view |> form("#cron-form", form: %{mode: "expression"}) |> render_change()
+
+    assert view
+           |> form("#cron-form", form: %{name: "Boot", mode: "expression", expression: "@reboot"})
+           |> render_change() =~ "@reboot is not supported"
+  end
+
   test "an unknown time zone is refused", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/recurring/new")
 

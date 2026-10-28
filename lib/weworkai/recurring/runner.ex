@@ -83,6 +83,8 @@ defmodule Weworkai.Recurring.Runner do
 
   defp parse(expression) do
     case Parser.parse(String.trim(expression)) do
+      # It parses, but has no dates: the scheduler raises on it.
+      {:ok, %{reboot: true}} -> {:error, "@reboot is not supported"}
       {:ok, parsed} -> {:ok, parsed}
       {:error, _message} -> {:error, "is not a valid cron expression"}
     end
@@ -137,13 +139,26 @@ defmodule Weworkai.Recurring.Runner do
     end)
   end
 
-  # The next slot is the first within the grace window: when it has come already (a cron
-  # running several times a day, back after an outage), the next tick fires it.
+  # The next slot is the newest within the grace window: when one has come already (a cron
+  # running several times a day, back after an outage), the next tick fires it, once; the
+  # older ones in the window are skipped too.
   defp skip!(cron, now) do
     Recurring.claim_cron!(cron, %{
-      next_run_at: next_slot(cron, DateTime.add(now, -@grace_minutes, :minute)),
+      next_run_at:
+        newest_slot(cron, next_slot(cron, DateTime.add(now, -@grace_minutes, :minute)), now),
       last_skipped_at: cron.next_run_at
     })
+  end
+
+  # The last slot from `slot` on that has come by `now`; `slot` itself when it is still ahead.
+  defp newest_slot(cron, slot, now) do
+    with %DateTime{} <- slot,
+         %DateTime{} = next <- next_slot(cron, slot),
+         true <- DateTime.compare(next, now) != :gt do
+      newest_slot(cron, next, now)
+    else
+      _ahead -> slot
+    end
   end
 
   @doc """
@@ -156,7 +171,15 @@ defmodule Weworkai.Recurring.Runner do
           {:ok, Weworkai.Board.Task.t()} | {:error, String.t()}
   def start(cron, now \\ DateTime.utc_now(), slot \\ nil) do
     slot = slot || now
-    cron = Recurring.claim_cron!(cron, %{last_run_at: now, next_run_at: next_slot(cron, now)})
+
+    cron =
+      Recurring.claim_cron!(
+        cron,
+        Map.merge(
+          %{last_run_at: now, next_run_at: next_slot(cron, now)},
+          missed_seen(cron)
+        )
+      )
 
     with {:ok, task} <- create_task(cron, slot, group_id(cron, slot)) do
       case Board.move_task(task, :todo) do
@@ -171,6 +194,14 @@ defmodule Weworkai.Recurring.Runner do
       {:error, error} -> failed!(cron, nil, ErrorText.readable(error))
     end
   end
+
+  # A skipped slot stays shown through the run that caught up after it, and is cleared by
+  # the run after that.
+  defp missed_seen(%{last_skipped_at: %DateTime{} = skipped, last_run_at: %DateTime{} = ran}) do
+    if DateTime.compare(ran, skipped) == :gt, do: %{last_skipped_at: nil}, else: %{}
+  end
+
+  defp missed_seen(_cron), do: %{}
 
   # A paused cron run by hand stays paused: no next slot.
   defp next_slot(%{enabled: false}, _from), do: nil

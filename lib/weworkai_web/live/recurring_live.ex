@@ -453,10 +453,8 @@ defmodule WeworkaiWeb.RecurringLive do
     end
   end
 
-  # A slot skipped since it last ran.
-  defp missed?(%{last_skipped_at: nil}), do: false
-  defp missed?(%{last_run_at: nil}), do: true
-  defp missed?(cron), do: DateTime.compare(cron.last_skipped_at, cron.last_run_at) == :gt
+  # A slot skipped lately: the runner clears it at the run after the one that caught up.
+  defp missed?(cron), do: not is_nil(cron.last_skipped_at)
 
   defp count(1, noun), do: "1 #{noun}"
   defp count(number, noun), do: "#{number} #{noun}s"

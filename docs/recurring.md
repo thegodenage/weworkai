@@ -34,6 +34,8 @@ Code: `lib/weworkai/recurring/` (Ash domain `Weworkai.Recurring`; `Cron`, `Runne
   missed by more (the app wasn't running) is skipped: no task, `last_skipped_at` records it,
   and the next slot is the first within the window, so after a long outage the newest slot
   still within it fires once (an hourly cron down for three hours: the last hour fires).
+  The Recurring tab shows the missed slot until the run after that catch-up clears it.
+  `@reboot` parses but has no dates, so it is refused.
 - A task that can't start stays in backlog; the cron shows why (`last_error`) and a
   `cron_failed` notification goes out. **Run now** fires a cron at once, its slot being now.
 - Deleting a cron keeps its tasks and groups (their `cron_id` is nilified).
