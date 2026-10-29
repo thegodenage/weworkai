@@ -67,9 +67,9 @@ move the task; see "Ask" below.
    (repo's Dockerfile/compose if present, else a fitting generic image). Web app / browser
    extension → installs Chrome/Chromium in that container and drives it (Playwright).
    Other app types → best-fit approach (CLI runs, API calls, test suite, fuzzing inputs).
-   Tears the container down afterwards. Goal: at least 5 real bugs. Every bug must be
-   reproduced with steps + evidence (command output / screenshot path). If fewer than 5 are
-   found within budget it reports the real count — never invents or inflates bugs.
+   Tears the container down afterwards. Reports only real bugs (none is a valid result).
+   Every bug must be reproduced with steps + evidence (command output / screenshot path) —
+   never invents or inflates bugs.
 3. Findings from either reviewer → coder session resumed with the list (`in_progress`) →
    coder fixes → back to step 1 (`review`). Max 3 rounds (the cap of the default's
    findings arrow; `review_round` on task), then ready to merge with the open findings

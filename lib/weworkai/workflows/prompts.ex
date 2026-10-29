@@ -245,9 +245,9 @@ defmodule Weworkai.Workflows.Prompts do
     2. A web app or browser extension: install Chrome or Chromium in that container and
        drive it with Playwright. Anything else: the best-fitting approach, such as running
        the CLI, calling the API, running the test suite or fuzzing inputs.
-    3. Aim for at least 5 real bugs. Reproduce every one: give `reproduction` steps and
-       `evidence` (command output or a screenshot path). If you find fewer within your
-       budget, report the real number. Never invent or inflate a bug.
+    3. Report only real bugs, and none if you find none. Never invent or inflate a bug.
+       Reproduce every one: give `reproduction` steps and `evidence` (command output or a
+       screenshot path).
     4. Tear down everything you created (`docker rm -f`, `docker compose -p #{prefix} down -v`)
        before you finish, also when something failed.
 
