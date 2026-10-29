@@ -262,6 +262,7 @@ being canceled even when the task itself doesn't change. Spinners stand still un
 | `plan_approved_at` | set by `approve_plan` |
 | `plan_session_id` / `code_session_id` | Claude conversation of the planner / coder, resumed by later runs |
 | `worktree_path` / `worktree_branch` | the coder's worktree, set when the coder is enqueued |
+| `worktree_repositories` | for a task on a folder of repositories, the repositories its (headless) worktree holds; `[]` for a single repository |
 | `review_round` | fix rounds so far (0–3); reset when a coder is enqueued |
 | `open_questions` | embedded `Board.Question` list waiting for a human (planner's or coder's); cleared by comment / answer / approve |
 | `findings` | embedded `Board.Finding` list of the current review round, each with `source` (`reviewer` \| `qa`) |
@@ -312,6 +313,13 @@ result (`--json-schema`) and must resume the same conversation (`--resume <uuid>
   container can reach (see "Agents run in containers"). The app never sends tool lists.
 - Coder works in a git worktree the bridge creates: `<repo>/.weworkai/worktrees/<task-short-id>`
   on branch `weworkai/<task-short-id>`.
+- **Headless worktrees.** A task's folder may be no git repository but a folder of them
+  (`~/Projects`). The coder then gets `<folder>/.weworkai/worktrees/<task-short-id>/`, a
+  folder holding one worktree per repository directly in it (`<id>/<repo>`), all on
+  `weworkai/<task-short-id>`; the task keeps their names (`worktree_repositories`) and every
+  prompt says so. The diff prefixes paths with the repository (`api/lib/x.ex`); the merger
+  merges each repository with commits. At most `CLAUDE_BRIDGE_MAX_REPOS` (default 20)
+  repositories; a folder with more is refused (pick a smaller one).
 - Files a human attaches to a task (at most 25 MB each, 100 MB per task) reach every run on
   it: the app sends them with the run (`attachments`, base64) and the bridge writes them to
   `<cwd>/.weworkai/attachments/<task-short-id>/` first, replacing the last run's copy.
@@ -349,6 +357,9 @@ Whatever an agent breaks stays in its container; only the mounts below reach the
   `worktree_diff`) would run what they name. A writable git directory still lets a coder
   move other branches' refs; it can't run code on the host. Commits carry the host's
   `git config user.name` / `user.email` of that repo (`GIT_AUTHOR_*` / `GIT_COMMITTER_*`).
+
+  A run in a folder of repositories, or in a headless worktree, gets the same for each
+  repository's git directory.
 - **Docker reviewer.** The host's Docker socket is never mounted. Each qa run gets a
   privileged `docker:dind` sidecar `cph-<run id>-dind` whose daemon listens on
   `127.0.0.1:2375` of a network namespace the agent shares (`--network container:…`,
@@ -362,6 +373,27 @@ Whatever an agent breaks stays in its container; only the mounts below reach the
   metadata or an HTTP reply (it does show in `docker inspect` of a running agent). Missing
   token → 422 "Agents have no Claude login: run `claude setup-token` …", which fails the
   job at once. Docker not running → 503, retried.
+- **Host tools.** CLIs in the image that act with your login on this computer
+  (`HOST_TOOLS` in the bridge; today `glab`). At each start the bridge reads the login
+  (`glab config get host`, `glab config get token --host …`) and passes it like the Claude
+  token, by name only: `GITLAB_HOST`, `GITLAB_TOKEN`. Every role gets it (a profile's
+  `host_tools` could turn it off); such a token can write to GitLab, push included, which no
+  mount prevents. Add a tool to `HOST_TOOLS` and the Dockerfile. The bridge prints at
+  startup which host tools are installed and logged in.
+- **Your `~/.claude`.** Each run gets a copy (symlinks followed; `.git`, `node_modules`
+  skipped; at most 50 MB per entry) of `CLAUDE.md`, `skills`, `agents` and `commands`
+  (override with `CLAUDE_BRIDGE_SHARE`, colon-separated; `CLAUDE_BRIDGE_CLAUDE_HOME` for
+  another folder), mounted read-only into the agent's `~/.claude` and deleted when the run
+  ends. Credentials, history, conversations, `settings.json` and plugins never reach agents.
+  `CLAUDE.md`, `CLAUDE.local.md` and `.claude/` of the run folder's parents (inside an
+  allowed root, below your home) are mounted read-only, so a worktree sees the main
+  repository's untracked ones.
+- **Tool usage.** `GET /sessions/:id` returns `tools`: what the run could use (claude's
+  tools and skills, the host tools and `~/.claude` parts it got) and what it used (calls per
+  tool, skills, each host-tool command); the run page shows it. Each finished run's
+  host-tool calls are appended to `~/.weworkai-bridge/tool-usage.jsonl` (pruned with the
+  runs) and printed by the bridge. `GET /tools` lists the host tools and their login, the
+  shared `~/.claude` and the latest 50 calls; the Connectors page shows it.
 - **Conversations** persist in the named volume `weworkai-agent-claude` (the agent's
   `CLAUDE_CONFIG_DIR`), keyed by cwd like on the host, so `--resume` works across runs.
   Host `claude --resume` doesn't see them; to continue one yourself:
@@ -452,7 +484,9 @@ Merger (`merge` schema):
   validation, `fork` argv and a fork starting beside its running conversation, attachments
   written before the container starts inside its read-only mount, stream-json rendering,
   concurrent resumes, stop and restart detection by
-  container, pruning and the finished-run cache; a fake docker CLI and `sh` in place of
+  container, pruning and the finished-run cache; headless worktrees (creation, diff,
+  mounts); the shared `~/.claude` copy and parent-folder memory; tool-usage parsing and
+  log; the GitLab token by name only; a fake docker CLI and `sh` in place of
   docker run, so no Docker needed).
 - Browser e2e: `docker compose --profile e2e run --rm e2e` — Playwright (Chromium) container
   (`e2e/`) driving a separate app instance, `web-e2e` (`http://web-e2e:4000`, database

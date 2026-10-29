@@ -147,11 +147,17 @@ defmodule Weworkai.BridgeStub do
         Req.Test.json(conn, %{
           "path" => "#{body["repo"]}/.weworkai/worktrees/#{body["name"]}",
           "branch" => "weworkai/#{body["name"]}",
-          "base" => String.duplicate("0", 40)
+          "base" => String.duplicate("0", 40),
+          # A repository named like a folder of repositories ("…/workspace") gets a headless one.
+          "repositories" =>
+            if(String.ends_with?(body["repo"], "/workspace"), do: ["api", "web"], else: [])
         })
 
       {"POST", "/worktrees/diff"} ->
         Req.Test.json(conn, %{"diff" => @diff, "truncated" => false})
+
+      {"GET", "/tools"} ->
+        Req.Test.json(conn, %{"hostTools" => [], "claudeHome" => [], "recent" => []})
 
       {"GET", "/models"} ->
         models(conn, Agent.get(state, &Map.get(&1, :models_down?, false)))

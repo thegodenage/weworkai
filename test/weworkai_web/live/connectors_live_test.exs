@@ -144,4 +144,58 @@ defmodule WeworkaiWeb.ConnectorsLiveTest do
     assert has_element?(view, "#connectors", "Work Claude")
     assert has_element?(view, "#connectors", "Home Claude")
   end
+
+  describe "what agents can use" do
+    # The section loads in an async task the LiveView starts while mounting.
+    setup do
+      Req.Test.set_req_test_to_shared()
+      on_exit(fn -> Req.Test.set_req_test_to_private() end)
+    end
+
+    test "lists host tools, the shared ~/.claude and recent calls", %{conn: conn} do
+      stub_bridge(fn conn ->
+        case conn.request_path do
+          "/auth/status" ->
+            logged_in(conn)
+
+          "/tools" ->
+            Req.Test.json(conn, %{
+              "hostTools" => [
+                %{
+                  "name" => "glab",
+                  "description" => "GitLab CLI",
+                  "installed" => true,
+                  "loggedIn" => true,
+                  "account" => "gitlab.com"
+                }
+              ],
+              "claudeHome" => [%{"name" => "skills", "items" => ["release-notes"]}],
+              "recent" => [
+                %{
+                  "at" => "2026-10-29T10:00:00+00:00",
+                  "name" => "cph-abcdefgh",
+                  "cwd" => "/Users/me/Projects",
+                  "tool" => "glab",
+                  "command" => "glab api /events"
+                }
+              ]
+            })
+        end
+      end)
+
+      "Mine" |> create_connector() |> Connectors.authenticate_connector!()
+      {:ok, view, _html} = live(conn, ~p"/connectors")
+      render_async(view)
+
+      assert has_element?(view, "#host-tool-glab", "gitlab.com")
+      assert has_element?(view, "#shared-claude-skills", "release-notes")
+      assert has_element?(view, "#host-tool-call-0", "glab api /events")
+    end
+
+    test "says so when no connector is connected", %{conn: conn} do
+      {:ok, view, _html} = live(conn, ~p"/connectors")
+      render_async(view)
+      assert has_element?(view, "#host-tools", "Connect a connector")
+    end
+  end
 end
