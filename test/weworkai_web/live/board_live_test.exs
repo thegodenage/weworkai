@@ -42,11 +42,25 @@ defmodule WeworkaiWeb.BoardLiveTest do
     Board.create_task!(%{title: "Write spec", description: "First draft"})
     lean = Weworkai.Workflows.create_workflow!("Lean")
     login = Board.create_task!(%{title: "Fix login", workflow_id: lean.id})
+    pasted = "screenshot-2026-10-28-143005-123.png"
+    Board.create_task!(%{title: "Pasted shot", description: "![#{pasted}](#{pasted})"})
+
+    Board.create_task!(%{
+      title: "Diagram",
+      description: "![kubernetes topology](https://example.com/k8s.png)"
+    })
+
     {:ok, view, _html} = live(conn, ~p"/")
 
     view |> form("#board-filters", filter: %{q: "draft"}) |> render_change()
     assert has_element?(view, "#column-backlog article", "Write spec")
     refute has_element?(view, "#column-backlog article", "Fix login")
+
+    # Search skips pasted screenshot references, but not other images' text.
+    view |> form("#board-filters", filter: %{q: "png"}) |> render_change()
+    refute has_element?(view, "#column-backlog article", "Pasted shot")
+    view |> form("#board-filters", filter: %{q: "kubernetes"}) |> render_change()
+    assert has_element?(view, "#column-backlog article", "Diagram")
 
     view |> form("#board-filters", filter: %{q: "", workflow: lean.id}) |> render_change()
     assert has_element?(view, "#column-backlog article", "Fix login")
@@ -573,8 +587,45 @@ defmodule WeworkaiWeb.BoardLiveTest do
     assert [%{name: "spec.md", size: 6}] = Board.list_attachments!(task.id)
   end
 
+  test "both description editors take pasted screenshots as attachments", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    assert has_element?(view, "#task-form-description[data-upload='attachments']")
+
+    task = Board.create_task!(%{title: "Pasted"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+    assert has_element?(view, "#task-drawer-description[data-upload='attachments']")
+  end
+
+  test "the drawer previews a pasted screenshot's reference as the attachment", %{conn: conn} do
+    task = Board.create_task!(%{title: "With a screenshot"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+    name = "screenshot-2026-10-28-143005-123.png"
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: "png", type: "image/png"}
+    ])
+    |> render_upload(name)
+
+    view
+    |> form("#task-drawer-description-form",
+      form: %{description: "Broken:\n\n![#{name}](#{name})\n\nAs `![#{name}](#{name})`"}
+    )
+    |> render_change()
+
+    assert [%{id: id}] = Board.list_attachments!(task.id)
+    assert has_element?(view, "#task-drawer-description-preview img[src='/attachments/#{id}']")
+    # Code that mentions the file keeps its name.
+    assert has_element?(view, "#task-drawer-description-preview code", "](#{name})")
+  end
+
   test "the drawer attaches a file once uploaded, shows it and removes it", %{conn: conn} do
-    task = Board.create_task!(%{title: "Needs a mockup"})
+    task =
+      Board.create_task!(%{
+        title: "Needs a mockup",
+        description: "Intro\n![mock up.png](mock up.png)"
+      })
+
     {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
 
     view
@@ -591,6 +642,143 @@ defmodule WeworkaiWeb.BoardLiveTest do
 
     assert Board.list_attachments!(task.id) == []
     refute has_element?(view, "#attachment-#{id}")
+    # A reference the user wrote stays; only pasted ones go with their file.
+    assert Board.get_task!(task.id).description == "Intro\n![mock up.png](mock up.png)"
+  end
+
+  test "removing a pasted screenshot drops its reference, saved at once", %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Pasted", description: "Intro\n![#{name}](#{name})"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: "png", type: "image/png"}
+    ])
+    |> render_upload(name)
+
+    [%{id: id}] = Board.list_attachments!(task.id)
+    view |> element("#remove-attachment-#{id}") |> render_click()
+
+    task_id = task.id
+    assert_push_event(view, "file-removed", %{name: ^name, task_id: ^task_id})
+    assert Board.get_task!(task.id).description == "Intro"
+  end
+
+  test "cancelling a replacement upload keeps the reference to the attached file",
+       %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Replaced", description: "![#{name}](#{name})"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+    file = %{name: name, content: String.duplicate("png", 100), type: "image/png"}
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [file])
+    |> render_upload(name)
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [file])
+    |> render_upload(name, 10)
+
+    view |> element("#task-drawer [id^='cancel-upload-']") |> render_click()
+
+    assert Board.get_task!(task.id).description == "![#{name}](#{name})"
+    assert [_] = Board.list_attachments!(task.id)
+  end
+
+  test "undoing a paste removes the pasted file", %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Undone"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: "png", type: "image/png"}
+    ])
+    |> render_upload(name)
+
+    render_hook(view, "unpaste", %{"name" => name})
+    assert Board.list_attachments!(task.id) == []
+  end
+
+  test "closing the drawer mid-upload drops the file's saved reference and says so",
+       %{conn: conn} do
+    name = "screenshot-2026-10-28-143005-123.png"
+    task = Board.create_task!(%{title: "Slow paste", description: "![#{name}](#{name})\nOutro"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: name, content: String.duplicate("png", 100), type: "image/png"}
+    ])
+    |> render_upload(name, 10)
+
+    render_patch(view, ~p"/")
+
+    assert Board.get_task!(task.id).description == "Outro"
+    assert Board.list_attachments!(task.id) == []
+    assert has_element?(view, "#flash-error", name)
+  end
+
+  test "a paste beyond the upload's room is refused with a message", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    assert has_element?(view, "#task-form-description[data-upload-room='10']")
+
+    render_hook(view, "paste_skipped", %{"count" => 2})
+    assert has_element?(view, "#flash-error", "2 not pasted")
+  end
+
+  test "the drawer previews an attached file whose name has a space", %{conn: conn} do
+    task = Board.create_task!(%{title: "Spaced"})
+    {:ok, view, _html} = live(conn, ~p"/tasks/#{task.id}/edit")
+
+    view
+    |> file_input("#task-drawer-attachments-form", :attachments, [
+      %{name: "my shot.png", content: "png", type: "image/png"}
+    ])
+    |> render_upload("my shot.png")
+
+    view
+    |> form("#task-drawer-description-form", form: %{description: "![shot](<my shot.png>)"})
+    |> render_change()
+
+    assert [%{id: id}] = Board.list_attachments!(task.id)
+    assert has_element?(view, "#task-drawer-description-preview img[src='/attachments/#{id}']")
+  end
+
+  test "cancelling a pending upload drops its pasted reference", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    name = "screenshot-2026-10-28-143005-123.png"
+
+    view
+    |> file_input("#task-form", :attachments, [%{name: name, content: "png", type: "image/png"}])
+    |> render_upload(name)
+
+    view |> element("#task-form [id^='cancel-upload-']") |> render_click()
+
+    assert_push_event(view, "file-removed", %{name: ^name})
+  end
+
+  test "an unattached reference previews as alt text, not a relative image", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/tasks/new")
+    name = "screenshot-2026-10-28-143005-123.png"
+
+    view
+    |> form("#task-form", form: %{description: "![#{name}](#{name})"})
+    |> render_change()
+
+    assert has_element?(view, "#task-form-description-preview img[alt='#{name}']")
+    refute has_element?(view, "#task-form-description-preview img[src]")
+  end
+
+  test "a card's excerpt leaves out image references", %{conn: conn} do
+    task =
+      Board.create_task!(%{title: "Shot", description: "![s.png](s.png)\nSee the screenshot"})
+
+    {:ok, view, _html} = live(conn, ~p"/")
+
+    assert has_element?(view, "[data-task-id='#{task.id}'] p", "See the screenshot")
+    refute has_element?(view, "[data-task-id='#{task.id}'] p", "![s.png]")
   end
 
   describe "agent activity" do

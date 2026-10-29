@@ -588,19 +588,49 @@ defmodule WeworkaiWeb.CoreComponents do
 
   @doc """
   Renders markdown as sanitized HTML.
+
+  `files` maps attached file names to their URLs, so `![shot.png](shot.png)` shows the attachment.
+  With `files`, an image by any other bare name shows its alt text; without, images render as is.
   """
   attr :content, :string, default: nil
   attr :class, :any, default: nil
+  attr :files, :map, default: nil
 
   def markdown(assigns) do
     ~H"""
     <div class={["markdown", @class]}>
       {Phoenix.HTML.raw(
-        MDEx.to_html!(@content || "", sanitize: MDEx.Document.default_sanitize_options())
+        @content
+        |> Kernel.||("")
+        |> MDEx.to_html!(sanitize: MDEx.Document.default_sanitize_options())
+        |> link_files(@files)
       )}
     </div>
     """
   end
+
+  # Rewrites the rendered image and link targets, so code that mentions a file is left alone.
+  # MDEx percent-encodes targets, so `my shot.png` arrives as `my%20shot.png`.
+  defp link_files(html, nil), do: html
+
+  defp link_files(html, files) do
+    files
+    |> Enum.reduce(html, fn {name, url}, html ->
+      Enum.reduce(Enum.uniq([name, URI.encode(name)]), html, fn target, html ->
+        target = target |> Phoenix.HTML.html_escape() |> Phoenix.HTML.safe_to_string()
+
+        html
+        |> String.replace(~s(src="#{target}"), ~s(src="#{url}"))
+        |> String.replace(~s(href="#{target}"), ~s(href="#{url}"))
+      end)
+    end)
+    |> drop_relative_images()
+  end
+
+  # An image left with a bare file name (not attached yet) would load e.g. /tasks/<name> and
+  # hit a page route; without a src the browser shows its alt text instead.
+  defp drop_relative_images(html),
+    do: String.replace(html, ~r{(<img\b[^>]*?) src="(?![a-zA-Z][a-zA-Z0-9+.-]*:|/)[^"]*"}, "\\1")
 
   @markdown_tools [
     {"hero-h2-micro", "Heading", "## ", ""},
@@ -615,17 +645,29 @@ defmodule WeworkaiWeb.CoreComponents do
   @doc """
   Renders a markdown textarea with a formatting toolbar and a Write/Preview switch.
   The preview renders `field.value` server-side, so it is as fresh as the form's last phx-change.
+
+  With an `upload`, images pasted into the textarea (a screenshot on ⌘V) go to that upload, and
+  a `![name](name)` reference to each goes in at the cursor. `files` (see `markdown/1`) lets the
+  preview show the ones already attached.
   """
   attr :id, :string, required: true
   attr :field, Phoenix.HTML.FormField, required: true
   attr :label, :string, default: nil
+  attr :upload, Phoenix.LiveView.UploadConfig, default: nil
+  attr :files, :map, default: %{}
   attr :rest, :global, include: ~w(placeholder rows phx-debounce)
 
   def markdown_editor(assigns) do
     assigns = assign(assigns, :tools, @markdown_tools)
 
     ~H"""
-    <div id={@id} class="fieldset mb-2" phx-hook=".MarkdownEditor">
+    <div
+      id={@id}
+      class="fieldset mb-2"
+      phx-hook=".MarkdownEditor"
+      data-upload={@upload && @upload.name}
+      data-upload-room={@upload && @upload.max_entries - length(@upload.entries)}
+    >
       <span :if={@label} class="label mb-1">{@label}</span>
       <div class="rounded-md border border-(--orpheus-border) bg-base-200 focus-within:border-primary">
         <div class="flex items-center gap-1 border-b border-(--orpheus-border) px-1 py-1">
@@ -666,7 +708,7 @@ defmodule WeworkaiWeb.CoreComponents do
           {@rest}
         >{Phoenix.HTML.Form.normalize_value("textarea", @field.value)}</textarea>
         <div id={"#{@id}-preview"} class="hidden min-h-24 px-3 py-2 text-sm">
-          <.markdown :if={@field.value not in [nil, ""]} content={@field.value} />
+          <.markdown :if={@field.value not in [nil, ""]} content={@field.value} files={@files} />
           <p :if={@field.value in [nil, ""]} class="text-(--orpheus-text-muted)">
             Nothing to preview
           </p>
@@ -674,20 +716,119 @@ defmodule WeworkaiWeb.CoreComponents do
       </div>
     </div>
     <script :type={Phoenix.LiveView.ColocatedHook} name=".MarkdownEditor">
+      const reference = ({name}) => `![${name}](${name})`
+      const removeReference = (textarea, name) => {
+        const ref = escapeRegExp(reference({name}))
+        // Only a reference on its own line, as pasted; code that mentions it isn't one.
+        const line = new RegExp(`^${ref}\n|\n?^${ref}$`, "gm")
+        if (!line.test(textarea.value)) return
+        textarea.value = textarea.value.replace(line, "")
+        textarea.dispatchEvent(new Event("input", {bubbles: true}))
+      }
+      // image/png -> .png; an extension is letters and digits only, as the server expects.
+      const extension = (type) => {
+        const subtype = type.split("/")[1]?.split("+")[0] ?? ""
+        const known = {"jpeg": "jpg", "x-icon": "ico", "vnd.microsoft.icon": "ico"}[subtype]
+        const ext = known ?? subtype.split(/[.-]/).pop().replace(/[^A-Za-z0-9]/g, "")
+        return ext ? `.${ext}` : ""
+      }
+      const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+
       export default {
         mounted() {
+          const textarea = this.el.querySelector("textarea")
+
           this.el.addEventListener("click", (event) => {
             const button = event.target.closest("[data-before]")
             if (!button) return
-            const textarea = this.el.querySelector("textarea")
             const {selectionStart: start, selectionEnd: end, value} = textarea
             const {before, after} = button.dataset
-            textarea.value = value.slice(0, start) + before + value.slice(start, end) + after + value.slice(end)
-            textarea.focus()
-            textarea.setSelectionRange(start + before.length, end + before.length)
+            const selected = value.slice(start, end)
+            // Keep the wrapped text selected.
+            this.replaceSelection(textarea, before + selected + after, before.length, before.length + selected.length)
+          })
+
+          textarea.addEventListener("paste", (event) => {
+            const upload = this.el.dataset.upload
+            const clipboard = event.clipboardData
+            if (!upload || !clipboard || clipboard.types.includes("text/plain")) return
+            const pasted = Array.from(clipboard.files).filter((file) => file.type.startsWith("image/"))
+            if (pasted.length === 0) return
+            event.preventDefault()
+            // More than the upload takes would fail the whole batch; keep the ones that fit.
+            const images = pasted.slice(0, this.room())
+            if (images.length < pasted.length) this.pushEvent("paste_skipped", {count: pasted.length - images.length})
+            if (images.length === 0) return
+            // Every screenshot pastes as "image.png", and a task keeps one file per name.
+            // Local time, like the name macOS gives a screenshot.
+            const now = new Date()
+            const pad = (n, width = 2) => String(n).padStart(width, "0")
+            const stamp =
+              `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-` +
+              `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${pad(now.getMilliseconds(), 3)}`
+            const named = images.map((file, i) => {
+              // A nameless file still needs its extension: attachments are told apart by it.
+              const ext = file.name.match(/\.[A-Za-z0-9]+$/)?.[0] ?? extension(file.type)
+              const index = images.length > 1 ? `-${i + 1}` : ""
+              return new File([file], `screenshot-${stamp}${index}${ext}`, {type: file.type})
+            })
+            this.upload(upload, named)
+            // One line per image, apart from the text around it.
+            const {selectionStart: start, selectionEnd: end, value} = textarea
+            const before = start > 0 && value[start - 1] !== "\n" ? "\n" : ""
+            const after = end < value.length && value[end] !== "\n" ? "\n" : ""
+            this.replaceSelection(textarea, before + named.map(reference).join("\n") + after)
+            this.pastes.push({before: value, after: textarea.value, files: named})
+            // Save now, not after the debounce: leaving first could save it to another task.
+            textarea.dispatchEvent(new FocusEvent("blur"))
+          })
+
+          // ⌘Z of the paste itself takes its files back out, and redoing it uploads them again.
+          // Only that exact step counts: from the text right after the paste back to right
+          // before it, or the other way round. Any other undo leaves attachments alone.
+          this.pastes = []
+          let previous = textarea.value
+          textarea.addEventListener("beforeinput", () => (previous = textarea.value))
+          textarea.addEventListener("input", (event) => {
+            const undo = event.inputType === "historyUndo"
+            if (!undo && event.inputType !== "historyRedo") return
+            const [from, to] = undo ? ["after", "before"] : ["before", "after"]
+            const paste = this.pastes.find((p) => p[from] === previous && p[to] === textarea.value)
+            if (!paste) return
+            if (undo) return paste.files.forEach(({name}) => this.pushEvent("unpaste", {name}))
+            // As on paste: keep what the upload has room for, and drop the others' references.
+            const fits = paste.files.slice(0, this.room())
+            const skipped = paste.files.slice(fits.length)
+            if (fits.length > 0) this.upload(this.el.dataset.upload, fits)
+            if (skipped.length === 0) return
+            this.pushEvent("paste_skipped", {count: skipped.length})
+            skipped.forEach(({name}) => removeReference(textarea, name))
+          })
+
+          // A cancelled or removed file takes its pasted reference with it.
+          this.handleEvent("file-removed", ({name, task_id}) => {
+            // The drawer may have moved on to another task, which keeps its references.
+            if ((textarea.dataset.taskId ?? null) !== task_id) return
+            removeReference(textarea, name)
+          })
+        },
+
+        // How many more files the upload takes.
+        room() {
+          return Math.max(0, Number(this.el.dataset.uploadRoom))
+        },
+
+        // Replaces the selection with text, then selects from..to within it (default: cursor after it).
+        replaceSelection(textarea, text, from = text.length, to = from) {
+          const {selectionStart: start, selectionEnd: end, value} = textarea
+          textarea.focus()
+          // insertText keeps the undo history (so ⌘Z works) and fires input itself.
+          if (!document.execCommand("insertText", false, text)) {
+            textarea.value = value.slice(0, start) + text + value.slice(end)
             // Programmatic edits don't fire input; LiveView needs it to see the change.
             textarea.dispatchEvent(new Event("input", {bubbles: true}))
-          })
+          }
+          textarea.setSelectionRange(start + from, start + to)
         },
       }
     </script>

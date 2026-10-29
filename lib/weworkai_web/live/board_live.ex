@@ -230,12 +230,46 @@ defmodule WeworkaiWeb.BoardLive do
   def handle_event("validate_attachments", _params, socket), do: {:noreply, socket}
 
   def handle_event("cancel_upload", %{"ref" => ref}, socket) do
-    {:noreply, cancel_upload(socket, :attachments, ref)}
+    entry = Enum.find(socket.assigns.uploads.attachments.entries, &(&1.ref == ref))
+
+    {:noreply,
+     socket
+     |> cancel_upload(:attachments, ref)
+     |> forget_files(if(entry, do: [entry.client_name], else: []))}
+  end
+
+  # The editor pasted more images than the upload has room for and kept only the first ones.
+  def handle_event("paste_skipped", %{"count" => count}, socket) do
+    max = socket.assigns.uploads.attachments.max_entries
+    {:noreply, put_flash(socket, :error, "#{count} not pasted: at most #{max} files at a time.")}
+  end
+
+  # A paste undone in the editor (⌘Z) takes its file back out: a pending upload is cancelled,
+  # an attached one removed.
+  def handle_event("unpaste", %{"name" => name}, socket) do
+    socket =
+      socket.assigns.uploads.attachments.entries
+      |> Enum.filter(&(&1.client_name == name and pasted?(name)))
+      |> Enum.reduce(socket, &cancel_upload(&2, :attachments, &1.ref))
+
+    case Enum.find(socket.assigns.attachments, &(&1.name == name and pasted?(name))) do
+      nil ->
+        {:noreply, socket}
+
+      attachment ->
+        Board.remove_attachment!(attachment)
+        {:noreply, assign(socket, attachments: Board.list_attachments!(socket.assigns.task.id))}
+    end
   end
 
   def handle_event("remove_attachment", %{"id" => id}, socket) do
-    socket.assigns.attachments |> Enum.find(&(&1.id == id)) |> Board.remove_attachment!()
-    {:noreply, assign(socket, attachments: Board.list_attachments!(socket.assigns.task.id))}
+    attachment = Enum.find(socket.assigns.attachments, &(&1.id == id))
+    Board.remove_attachment!(attachment)
+
+    {:noreply,
+     socket
+     |> assign(attachments: Board.list_attachments!(socket.assigns.task.id))
+     |> forget_files([attachment.name])}
   end
 
   # The workflow moves tasks too; whatever changed a task, its card follows.
@@ -339,7 +373,9 @@ defmodule WeworkaiWeb.BoardLive do
   defp text?(task, query) do
     case String.downcase(String.trim(query)) do
       "" -> true
-      query -> String.contains?(String.downcase("#{task.title} #{task.description}"), query)
+      query ->
+        text = without_pasted("#{task.title} #{task.description}")
+        String.contains?(String.downcase(text), query)
     end
   end
 
@@ -424,7 +460,23 @@ defmodule WeworkaiWeb.BoardLive do
   defp close_uploads(%{assigns: %{uploads_consumed?: true}} = socket),
     do: assign(socket, uploads_consumed?: false)
 
-  defp close_uploads(socket), do: cancel_uploads(socket)
+  # A drawer closed mid-upload saved the pasted references already; they go with the files.
+  defp close_uploads(socket) do
+    entries = socket.assigns.uploads.attachments.entries
+    in_flight = for entry <- entries, entry.valid?, do: entry.client_name
+
+    socket =
+      socket
+      |> cancel_uploads()
+      |> forget_files(Enum.map(entries, & &1.client_name))
+
+    if in_flight != [] and socket.assigns[:task] do
+      names = Enum.join(in_flight, ", ")
+      put_flash(socket, :error, "Not attached: #{names}. The drawer closed before it uploaded.")
+    else
+      socket
+    end
+  end
 
   defp cancel_uploads(socket) do
     Enum.reduce(socket.assigns.uploads.attachments.entries, socket, fn entry, socket ->
@@ -482,6 +534,67 @@ defmodule WeworkaiWeb.BoardLive do
   end
 
   defp uploading?(upload), do: Enum.any?(upload.entries, &(not &1.done?))
+
+  # Pasted files that won't be attached take their `![name](name)` lines with them: the editor
+  # drops them from its textarea, and the drawer's task from its saved description, as the
+  # editor's debounced save is lost if the drawer closes first. Only names the editor made
+  # count, and only while no file of that name stays attached (an upload may replace one).
+  defp forget_files(socket, names) do
+    attached = socket.assigns |> Map.get(:attachments, []) |> MapSet.new(& &1.name)
+    names = Enum.filter(names, &(pasted?(&1) and not MapSet.member?(attached, &1)))
+    task_id = socket.assigns[:task] && socket.assigns.task.id
+
+    socket =
+      Enum.reduce(names, socket, &push_event(&2, "file-removed", %{name: &1, task_id: task_id}))
+
+    with [_ | _] <- names,
+         %Task{id: id} <- socket.assigns[:task],
+         {:ok, task} <- Board.get_task(id),
+         description when description != task.description <-
+           without_references(task.description, names),
+         {:ok, task} <- Board.update_task(task, %{description: description}) do
+      socket
+      |> place(task)
+      |> assign(details_form: to_form(Board.form_to_update_task(task)))
+    else
+      _ -> socket
+    end
+  end
+
+  defp without_references(nil, _names), do: nil
+
+  defp without_references(description, names) do
+    Enum.reduce(names, description, fn name, description ->
+      # Only a reference on its own line, as pasted; code that mentions it isn't one.
+      reference = Regex.escape("![#{name}](#{name})")
+      line = Regex.compile!("^#{reference}\\n|\\n?^#{reference}$", "m")
+      String.replace(description, line, "")
+    end)
+  end
+
+  # The names the description editor gives pasted images.
+  defp pasted?(name),
+    do: name =~ ~r/^screenshot-\d{4}-\d{2}-\d{2}-\d{6}-\d{3}(-\d+)?(\.[A-Za-z0-9]+)?$/
+
+  # Pasted references are long and say nothing, so search skips them.
+  defp without_pasted(text),
+    do: String.replace(text, ~r/!\[(screenshot-[\d-]+(\.[A-Za-z0-9]+)?)\]\(\1\)/, "")
+
+  # Image references are long and say nothing on a card.
+  defp without_images(text), do: String.replace(text, ~r/!\[[^\]]*\]\([^)]*\)/, "")
+
+  defp excerpt(nil), do: nil
+
+  defp excerpt(description) do
+    case description |> without_images() |> String.trim() do
+      "" -> nil
+      text -> text
+    end
+  end
+
+  # Lets the description's preview show the attachments it references by name.
+  defp attachment_urls(attachments),
+    do: Map.new(attachments, &{&1.name, ~p"/attachments/#{&1.id}"})
 
   defp file_size(bytes) when bytes < 1_000, do: "#{bytes} B"
   defp file_size(bytes) when bytes < 1_000_000, do: "#{div(bytes, 1_000)} KB"
@@ -676,10 +789,10 @@ defmodule WeworkaiWeb.BoardLive do
                 </div>
                 <p class="text-[13px] leading-snug font-medium break-words">{task.title}</p>
                 <p
-                  :if={task.description}
+                  :if={excerpt(task.description)}
                   class="mt-1 line-clamp-2 break-words text-(--orpheus-text-muted)"
                 >
-                  {task.description}
+                  {excerpt(task.description)}
                 </p>
                 <div
                   :if={task.assignee || task.stage || task.current_node || task.child_count > 0}
@@ -952,7 +1065,10 @@ defmodule WeworkaiWeb.BoardLive do
             <.markdown_editor
               id="task-drawer-description"
               field={@details_form[:description]}
-              placeholder="Add a description…"
+              upload={@uploads.attachments}
+              files={attachment_urls(@attachments)}
+              data-task-id={@task.id}
+              placeholder="Add a description… Paste a screenshot to attach it."
               rows="12"
               phx-debounce="800"
             />
@@ -1023,8 +1139,9 @@ defmodule WeworkaiWeb.BoardLive do
           <.markdown_editor
             id="task-form-description"
             field={@form[:description]}
+            upload={@uploads.attachments}
             label="Description"
-            placeholder="Add a description…"
+            placeholder="Add a description… Paste a screenshot to attach it."
             rows="6"
           />
           <div class="fieldset mb-2">
@@ -1073,7 +1190,9 @@ defmodule WeworkaiWeb.BoardLive do
       class="flex cursor-pointer items-center justify-center gap-2 rounded-md border border-dashed border-(--orpheus-border) px-3 py-4 text-sm text-(--orpheus-text-muted) transition-colors hover:border-primary/60 hover:text-base-content phx-drop-target-active:border-primary phx-drop-target-active:bg-primary/5"
     >
       <.icon name="hero-arrow-up-tray-micro" class="size-4" />
-      <span>Drop files or <span class="text-primary">browse</span></span>
+      <span>
+        Drop files, paste into the description, or <span class="text-primary">browse</span>
+      </span>
       <.live_file_input upload={@upload} class="sr-only" />
     </label>
     <p :for={error <- upload_errors(@upload)} class="mt-1 text-xs text-error">
