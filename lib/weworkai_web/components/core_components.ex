@@ -714,9 +714,12 @@ defmodule WeworkaiWeb.CoreComponents do
     </div>
     <script :type={Phoenix.LiveView.ColocatedHook} name=".MarkdownEditor">
       const reference = ({name}) => `![${name}](${name})`
+      // image/png -> .png; an extension is letters and digits only, as the server expects.
       const extension = (type) => {
-        const subtype = type.split("/")[1]?.split("+")[0]
-        return subtype ? `.${subtype === "jpeg" ? "jpg" : subtype}` : ""
+        const subtype = type.split("/")[1]?.split("+")[0] ?? ""
+        const known = {"jpeg": "jpg", "x-icon": "ico", "vnd.microsoft.icon": "ico"}[subtype]
+        const ext = known ?? subtype.split(/[.-]/).pop().replace(/[^A-Za-z0-9]/g, "")
+        return ext ? `.${ext}` : ""
       }
       const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
@@ -764,20 +767,25 @@ defmodule WeworkaiWeb.CoreComponents do
             const before = start > 0 && value[start - 1] !== "\n" ? "\n" : ""
             const after = end < value.length && value[end] !== "\n" ? "\n" : ""
             this.replaceSelection(textarea, before + named.map(reference).join("\n") + after)
-            named.forEach(({name}) => this.pasted.add(name))
+            this.pastes.push({before: value, after: textarea.value, files: named})
             // Save now, not after the debounce: leaving first could save it to another task.
             textarea.dispatchEvent(new FocusEvent("blur"))
           })
 
-          // ⌘Z of a paste takes its file back out too.
-          this.pasted = new Set()
+          // ⌘Z of the paste itself takes its files back out, and redoing it uploads them again.
+          // Only that exact step counts: from the text right after the paste back to right
+          // before it, or the other way round. Any other undo leaves attachments alone.
+          this.pastes = []
+          let previous = textarea.value
+          textarea.addEventListener("beforeinput", () => (previous = textarea.value))
           textarea.addEventListener("input", (event) => {
-            if (event.inputType !== "historyUndo") return
-            for (const name of this.pasted) {
-              if (textarea.value.includes(reference({name}))) continue
-              this.pasted.delete(name)
-              this.pushEvent("unpaste", {name})
-            }
+            const undo = event.inputType === "historyUndo"
+            if (!undo && event.inputType !== "historyRedo") return
+            const [from, to] = undo ? ["after", "before"] : ["before", "after"]
+            const paste = this.pastes.find((p) => p[from] === previous && p[to] === textarea.value)
+            if (!paste) return
+            if (undo) paste.files.forEach(({name}) => this.pushEvent("unpaste", {name}))
+            else this.upload(this.el.dataset.upload, paste.files)
           })
 
           // A cancelled or removed file takes its pasted reference with it.
