@@ -28,7 +28,22 @@ workflow (its start block, or the block it is on), and the workflow assigns it. 
 naming an agent runs that agent (it must be able to run). A role block runs the first
 agent in the role that can run (by id); a coder role block runs the task's
 `pinned_coder_id` instead when the plan's approval picked one (binding: it must be able to
-run). When the block about to run has no agent that can, the action is refused naming the
+run). **Default agents**: a role block whose role has no agent at all, while a connector
+is connected, makes one first (`Organization.DefaultAgent`): an agent employee named after
+the role ("Planner", "Docker reviewer", …) on the first connected connector by name, with
+the first model it offers and the role's default prompt. It stays an ordinary employee,
+configurable on the Employees page, and the role's later blocks run it; a role with any
+agent never gets one. So a fresh install runs the template workflows with only a connector.
+Deleting a default agent doesn't stick: the next block in its role makes it again. To keep
+a role's blocks from running (say, to skip reviews), take its blocks out of the workflow,
+or keep an agent in the role without a model (its reviewer / qa blocks are then skipped).
+When the default agent can't be made (the connector can't list its models, or lists none),
+nobody is made and the block is refused with the reason, a reviewer / qa block too, so the
+task stops with a human rather than skipping its review ("Coder can't run: No coder agent
+yet, and none could be made on Claude: Claude bridge is not running. …"). A same-named
+employee makes it "Planner 2". Asking about a task with no planner at all makes the default
+planner to answer (docs/workflow.md).
+When the block about to run has no agent that can, the action is refused naming the
 block and what is missing ("Coder can't run: No coder agent yet. Add one on the
 Employees page.", "Ada can't run: Ada has no model yet. …"); the card stays put. A
 reviewer / qa role block with no agent that can run is skipped with a `stage_skipped`

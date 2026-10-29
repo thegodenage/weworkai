@@ -39,6 +39,13 @@ defmodule Weworkai.Workflows.EngineTest do
     employee
   end
 
+  defp with_status(connector, status) do
+    connector
+    |> Ash.Changeset.for_update(:update, %{})
+    |> Ash.Changeset.force_change_attribute(:status, status)
+    |> Ash.update!()
+  end
+
   defp team(connector, roles) do
     Map.new(roles, &{&1, agent(connector, "#{&1}", &1)})
   end
@@ -919,6 +926,131 @@ defmodule Weworkai.Workflows.EngineTest do
                "folder" => folder,
                "files" => [%{"name" => "mock_.png", "content" => Base.encode64(png <> png)}]
              }
+    end
+  end
+
+  describe "default agents" do
+    test "with only a connected connector, each role block makes its default agent and runs it",
+         %{bridge: bridge, connector: connector} do
+      connector = with_status(connector, :connected)
+
+      task =
+        Board.create_task!(%{
+          title: "Greet users",
+          description: "Say hello",
+          repository: "/repos/app"
+        })
+
+      Board.move_task!(task, :todo)
+      BridgeStub.step(bridge)
+
+      assert [%{"profile" => "planner", "model" => "claude-opus-5-5"}] = started_runs()
+      task = Board.get_task!(task.id)
+      assert %{status: :await_human_supervision, stage: :planning} = task
+
+      assert [%{name: "Planner", agent: %{role: :planner, model: "claude-opus-5-5"} = planner}] =
+               Organization.list_all_employees!(load: [agent: :connector_link])
+
+      assert planner.connector_link.connector_id == connector.id
+
+      Board.approve_plan!(task)
+      BridgeStub.step(bridge)
+      BridgeStub.step(bridge)
+      BridgeStub.step(bridge)
+
+      assert ["coder", "reviewer", "qa"] = Enum.map(started_runs(), & &1["profile"])
+      assert Engine.ready_to_merge?(Board.get_task!(task.id))
+      refute :stage_skipped in notification_kinds()
+
+      assert ["Coder", "Docker reviewer", "Planner", "Reviewer"] =
+               Enum.map(Organization.list_all_employees!(), & &1.name)
+    end
+
+    test "a role that has an agent gets no default one", %{bridge: bridge, connector: connector} do
+      ada = agent(with_status(connector, :connected), "Ada", :planner)
+      task = Board.create_task!(%{title: "Greet users", repository: "/repos/app"})
+      Board.move_task!(task, :todo)
+      BridgeStub.step(bridge)
+
+      assert [%{id: id}] = Organization.list_all_employees!()
+      assert id == ada.id
+    end
+
+    test "a role whose agent lacks setup is refused, not given a default one",
+         %{connector: connector} do
+      connector = with_status(connector, :connected)
+
+      Organization.create_employee!(%{
+        kind: :agent,
+        name: "Ada",
+        agent_role: :planner,
+        connector_id: connector.id
+      })
+
+      task = Board.create_task!(%{title: "Greet users", repository: "/repos/app"})
+
+      assert {:error, %Ash.Error.Invalid{errors: [error]}} = Board.move_task(task, :todo)
+
+      assert ErrorText.readable(error) ==
+               "Planner can't run: Ada has no model yet. Configure it on the Employees page."
+
+      assert ["Ada"] = Enum.map(Organization.list_all_employees!(), & &1.name)
+    end
+
+    test "a connector that can't list its models makes nobody, and the refusal says why",
+         %{bridge: bridge, connector: connector} do
+      with_status(connector, :connected)
+      BridgeStub.models_down(bridge, true)
+      task = Board.create_task!(%{title: "Bare"})
+
+      assert {:error, %Ash.Error.Invalid{errors: [error]}} =
+               Board.continue_task(task, block_id(task, "Coder"))
+
+      assert ErrorText.readable(error) ==
+               "Coder can't run: No coder agent yet, and none could be made on Claude: " <>
+                 "Claude bridge failed: restarting."
+
+      assert Organization.list_all_employees!() == []
+    end
+
+    test "a review whose default agent can't be made stops the task, instead of skipping",
+         %{bridge: bridge, connector: connector} = context do
+      {task, team} = planned_task(context, [])
+      with_status(connector, :connected)
+      Board.approve_plan!(task, team.coder.id)
+      BridgeStub.models_down(bridge, true)
+      BridgeStub.step(bridge)
+
+      assert %{status: :await_human_supervision} = task = Board.get_task!(task.id)
+      refute Engine.ready_to_merge?(task)
+      refute :stage_skipped in notification_kinds()
+      assert [:workflow_stuck | _] = notification_kinds()
+
+      assert ["coder", "planner"] =
+               Enum.map(Organization.list_all_employees!(), & &1.name)
+    end
+
+    test "a default agent doesn't take a teammate's name", %{bridge: bridge, connector: connector} do
+      with_status(connector, :connected)
+      Organization.create_employee!(%{kind: :human, name: "Planner", role: "Product planner"})
+      task = Board.create_task!(%{title: "Greet users", repository: "/repos/app"})
+      Board.move_task!(task, :todo)
+      BridgeStub.step(bridge)
+
+      assert ["Planner", "Planner 2"] = Enum.map(Organization.list_all_employees!(), & &1.name)
+    end
+
+    test "without a connected connector a role nobody has is refused", %{connector: connector} do
+      with_status(connector, :error)
+      task = Board.create_task!(%{title: "Bare"})
+
+      assert {:error, %Ash.Error.Invalid{errors: [error]}} =
+               Board.continue_task(task, block_id(task, "Coder"))
+
+      assert ErrorText.readable(error) ==
+               "Coder can't run: No coder agent yet. Add one on the Employees page."
+
+      assert Organization.list_all_employees!() == []
     end
   end
 

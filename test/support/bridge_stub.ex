@@ -27,6 +27,9 @@ defmodule Weworkai.BridgeStub do
     state
   end
 
+  @doc "Makes `GET /models` fail (`true`), as a restarting bridge does, or answer again."
+  def models_down(state, down?), do: Agent.update(state, &Map.put(&1, :models_down?, down?))
+
   @doc """
   Queues `result` for the next run of `profile`: a structured map, `{:answer, text}` (a
   plain final result, as a question's run ends), `:fail` or `:no_output`.
@@ -137,9 +140,23 @@ defmodule Weworkai.BridgeStub do
       {"POST", "/worktrees/diff"} ->
         Req.Test.json(conn, %{"diff" => @diff, "truncated" => false})
 
+      {"GET", "/models"} ->
+        models(conn, Agent.get(state, &Map.get(&1, :models_down?, false)))
+
       {"GET", "/folders"} ->
         folders(conn, URI.decode_query(conn.query_string)["path"])
     end
+  end
+
+  defp models(conn, true = _down?) do
+    conn |> Plug.Conn.put_status(503) |> Req.Test.json(%{"error" => "restarting"})
+  end
+
+  defp models(conn, false) do
+    Req.Test.json(conn, %{
+      "models" => [%{"id" => "claude-opus-5-5", "label" => "Opus 5.5"}],
+      "efforts" => ["low", "medium", "high"]
+    })
   end
 
   defp folders(conn, "") do

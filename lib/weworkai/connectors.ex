@@ -23,6 +23,15 @@ defmodule Weworkai.Connectors do
 
   defp adapter(connector), do: Provider.adapter(connector.provider)
 
+  @doc "The first connected connector by name, which backs default agents; nil when none is."
+  def first_connected do
+    Connector
+    |> Ash.Query.filter(status == :connected)
+    |> Ash.Query.sort(name: :asc, id: :asc)
+    |> Ash.Query.limit(1)
+    |> Ash.read_one!()
+  end
+
   @doc "Number of connectors listed before `connector` under `filters`, in list order."
   def position(connector, filters) do
     Connector
