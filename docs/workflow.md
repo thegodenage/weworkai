@@ -318,8 +318,7 @@ result (`--json-schema`) and must resume the same conversation (`--resume <uuid>
   folder holding one worktree per repository directly in it (`<id>/<repo>`), all on
   `weworkai/<task-short-id>`; the task keeps their names (`worktree_repositories`) and every
   prompt says so. The diff prefixes paths with the repository (`api/lib/x.ex`); the merger
-  merges each repository with commits. At most `CLAUDE_BRIDGE_MAX_REPOS` (default 20)
-  repositories; a folder with more is refused (pick a smaller one).
+  merges each repository with commits.
 - Files a human attaches to a task (at most 25 MB each, 100 MB per task) reach every run on
   it: the app sends them with the run (`attachments`, base64) and the bridge writes them to
   `<cwd>/.weworkai/attachments/<task-short-id>/` first, replacing the last run's copy.

@@ -21,7 +21,7 @@ Agents also get the host's login of each HOST_TOOLS CLI (glab), by name in their
 environment like the Claude token, and a read-only copy of CLAUDE.md, skills, agents and
 commands from ~/.claude (CLAUDE_BRIDGE_CLAUDE_HOME; CLAUDE_BRIDGE_SHARE overrides the list).
 A task's folder may be a folder of repositories: its worktree then holds one worktree per
-repository (at most CLAUDE_BRIDGE_MAX_REPOS, default 20).
+repository.
 
 Each run's stream lands in CLAUDE_BRIDGE_STATE (default ~/.weworkai-bridge)/runs/<id>.jsonl
 next to <id>.json (metadata), so runs outlive a bridge restart. Finished runs are deleted
@@ -153,7 +153,6 @@ MAX_DIFF = 300_000
 MAX_FOLDERS = 500
 # A task's folder may be no repository but a folder of them (~/Projects): its worktree is a
 # folder holding one worktree per repository, all on the task's branch.
-MAX_REPOSITORIES = int(os.environ.get("CLAUDE_BRIDGE_MAX_REPOS", "20"))
 MAX_TOOL_SUMMARY = 160
 
 meta_lock = threading.Lock()
@@ -314,6 +313,16 @@ def child_repositories(folder):
     return [child for child in sorted(folder.iterdir(), key=lambda child: child.name.lower())
             if child.is_dir() and not child.is_symlink() and not child.name.startswith(".")
             and (child / ".git").exists()]
+
+
+def distinct_repositories(folders):
+    """One folder per repository, its main checkout over its linked worktrees: git checks a
+    branch out in one worktree of a repository only."""
+    by_git_directory = {}
+    for folder in sorted(folders, key=lambda folder: not (folder / ".git").is_dir()):
+        by_git_directory.setdefault(git_directory(folder), folder)
+    return sorted((folder for git_dir, folder in by_git_directory.items() if git_dir),
+                  key=lambda folder: folder.name.lower())
 
 
 def git_directories(folder):
@@ -989,12 +998,9 @@ def create_worktree(body):
     if toplevel == str(repo):
         exclude_state_folder(repo)
         return {"path": str(path), "branch": branch, "base": add_worktree(repo, path, branch), "repositories": []}
-    repositories = [] if toplevel else child_repositories(repo)
+    repositories = [] if toplevel else distinct_repositories(child_repositories(repo))
     if not repositories:
         raise Rejected(422, f"{repo} is neither the root of a git repository nor a folder of them")
-    if len(repositories) > MAX_REPOSITORIES:
-        raise Rejected(422, f"{repo} holds {len(repositories)} git repositories; a worktree across them takes at "
-                            f"most {MAX_REPOSITORIES} (CLAUDE_BRIDGE_MAX_REPOS). Pick a folder with fewer")
     path.mkdir(parents=True, exist_ok=True)
     for child in repositories:
         add_worktree(child, path / child.name, branch)
@@ -1419,7 +1425,8 @@ def test_headless(scratch):
         git_output(repo, "add", ".")
         git_output(repo, "commit", "-q", "-m", "init")
     (workspace / "notes").mkdir()
-    headless = workspace / ".weworkai" / "worktrees" / "abcd1234"
+    git_output(workspace / "web", "worktree", "add", "-q", "-b", "feature", str(workspace / "web-feature"))
+    headless =workspace / ".weworkai" / "worktrees" / "abcd1234"
     created = create_worktree({"repo": str(workspace), "name": "abcd1234"})
     assert created == {"path": str(headless), "branch": "weworkai/abcd1234", "base": None,
                        "repositories": ["api", "web"]}, created
