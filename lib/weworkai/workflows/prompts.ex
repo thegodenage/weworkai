@@ -45,13 +45,14 @@ defmodule Weworkai.Workflows.Prompts do
 
   def code(task, step \\ nil) do
     fit("""
-    You are the coder. Implement the approved plan below in your working directory, a git
-    worktree on branch `#{task.worktree_branch}`. Work only inside it.
+    You are the coder. Implement the approved plan below in your working directory,
+    #{worktree_place(task)}. Work only inside it.
 
     - Follow the plan. If it turns out wrong, or you need a decision it does not cover,
       stop and finish with status `blocked` and your `questions` instead of guessing.
     - Run the relevant tests and make them pass.
-    - Commit your work on branch `#{task.worktree_branch}` with clear messages. Never push.
+    - Commit your work on branch `#{task.worktree_branch}` (in each repository you change)
+      with clear messages. Never push.
     - When the scope is large, split the work and hand parts to subagents (Task tool).
 
     Finish with `status` (`done` or `blocked`), a markdown `summary` of what you did, and
@@ -92,7 +93,7 @@ defmodule Weworkai.Workflows.Prompts do
     `#{task.worktree_path}`) into #{target}. Your working directory is the repository
     `#{task.repository}`; its git directory and every worktree in it are writable.
 
-    1. In the task's worktree, commit any uncommitted work on `#{task.worktree_branch}`
+    #{merge_repositories(task)}1. In the task's worktree, commit any uncommitted work on `#{task.worktree_branch}`
        (leave `.weworkai/` out).
     2. Find where the target branch is checked out (`git worktree list`):
        - in the repository or another worktree: merge there, but only if it has no
@@ -207,14 +208,15 @@ defmodule Weworkai.Workflows.Prompts do
 
   def review(task, diff, step \\ nil) do
     fit("""
-    You are the code reviewer. Review the change in your working directory, a git worktree
-    on branch `#{task.worktree_branch}`, against the plan it implements. You can only read.
+    You are the code reviewer. Review the change in your working directory,
+    #{worktree_place(task)}, against the plan it implements. You can only read.
 
     Report real problems only: bugs, plan steps that are missing or done wrong, security
     issues, broken or missing tests, code that will not build. For each finding give a
     `severity` (high, medium or low), a `title`, the `path` and `line`, and `details`
     (markdown). Never invent a finding; return an empty `findings` list when the change is good.
-    The diff below may be cut off; use `git diff` and `git log` in the worktree for the rest.
+    The diff below may be cut off; use `git diff` and `git log` in the worktree (each one,
+    when there are several) for the rest.
 
     #{step_section(step)}#{task_section(task)}
 
@@ -234,8 +236,8 @@ defmodule Weworkai.Workflows.Prompts do
     prefix = "cph-qa-#{Weworkai.Workflows.Engine.short_id(task)}"
 
     fit("""
-    You are the docker reviewer. Test the change in your working directory, a git worktree
-    on branch `#{task.worktree_branch}`, by building and running it, not by reading it.
+    You are the docker reviewer. Test the change in your working directory,
+    #{worktree_place(task)}, by building and running it, not by reading it.
 
     1. Build and run it in your own throwaway Docker container. Use the repository's
        Dockerfile or compose file if it has one, otherwise a fitting generic image. Prefix
@@ -287,6 +289,29 @@ defmodule Weworkai.Workflows.Prompts do
     #{material(task)}
     """)
   end
+
+  # Where the task's code is: a worktree, or for a task on a folder of repositories a folder
+  # of worktrees, one per repository.
+  defp worktree_place(%{worktree_repositories: [_ | _] = repositories} = task) do
+    "a folder with one git worktree per repository " <>
+      "(#{Enum.map_join(repositories, ", ", &"`#{&1}/`")}), each on branch `#{task.worktree_branch}`"
+  end
+
+  defp worktree_place(task), do: "a git worktree on branch `#{task.worktree_branch}`"
+
+  defp merge_repositories(%{worktree_repositories: [_ | _] = repositories} = task) do
+    """
+    The task spans several repositories, each `#{task.repository}/<name>` with its worktree
+    at `#{task.worktree_path}/<name>`: #{Enum.map_join(repositories, ", ", &"`#{&1}`")}. Do the
+    steps below in each one whose branch has commits beyond the target and skip the others.
+    Stop at the first that ends `blocked`, leaving those already merged as they are. Report
+    `branch` once, `commit` as the last merge's hash, and each repository's merge commit in
+    the summary.
+
+    """
+  end
+
+  defp merge_repositories(_task), do: ""
 
   defp material(task) do
     [

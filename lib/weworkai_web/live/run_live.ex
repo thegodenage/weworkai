@@ -19,7 +19,8 @@ defmodule WeworkaiWeb.RunLive do
            run: run,
            status: watch(socket, run),
            error: nil,
-           output_hash: nil
+           output_hash: nil,
+           tools: nil
          )}
 
       {:error, _} ->
@@ -42,7 +43,11 @@ defmodule WeworkaiWeb.RunLive do
   def handle_info({:session, id, {:ok, session}}, socket) do
     if DashboardLive.final_status?(session.status), do: SessionPoller.unwatch_session(id)
     hash = :erlang.phash2(session.output)
-    socket = socket |> assign(status: session.status, error: nil) |> load_usage()
+
+    socket =
+      socket
+      |> assign(status: session.status, error: nil, tools: Map.get(session, :tools))
+      |> load_usage()
 
     if hash == socket.assigns.output_hash do
       {:noreply, socket}
@@ -148,6 +153,63 @@ defmodule WeworkaiWeb.RunLive do
         <div class="overflow-x-auto rounded-lg border border-(--orpheus-border) bg-[#0c0c0c] p-3">
           <div id="terminal" phx-hook="Terminal" phx-update="ignore"></div>
         </div>
+
+        <section :if={@tools} id="run-tools" class="mt-4 grid gap-3 text-sm md:grid-cols-3">
+          <div id="run-tool-calls" class="rounded-lg border border-(--orpheus-border) p-3">
+            <h3 class="mb-2 text-xs font-medium uppercase tracking-wide text-(--orpheus-text-muted)">
+              Tool calls
+            </h3>
+            <p :if={@tools.calls == %{}} class="text-(--orpheus-text-muted)">None yet.</p>
+            <ul class="flex flex-wrap gap-1.5">
+              <li
+                :for={{name, count} <- Enum.sort_by(@tools.calls, fn {_name, count} -> -count end)}
+                class="rounded bg-base-300 px-1.5 py-0.5 font-mono text-xs"
+              >
+                {name} ×{count}
+              </li>
+            </ul>
+          </div>
+          <div id="run-host-tools" class="rounded-lg border border-(--orpheus-border) p-3">
+            <h3 class="mb-2 text-xs font-medium uppercase tracking-wide text-(--orpheus-text-muted)">
+              Host tools
+            </h3>
+            <p :if={@tools.host_tools == []} class="text-(--orpheus-text-muted)">
+              None: no host login reached this run.
+            </p>
+            <p :if={@tools.host_tools != []} class="mb-1 text-xs text-(--orpheus-text-secondary)">
+              Had {Enum.join(@tools.host_tools, ", ")}
+            </p>
+            <ul class="space-y-1">
+              <li
+                :for={{call, index} <- Enum.with_index(@tools.host_calls)}
+                id={"run-host-call-#{index}"}
+                class="truncate font-mono text-xs"
+              >
+                {call.command}
+              </li>
+            </ul>
+          </div>
+          <div id="run-skills" class="rounded-lg border border-(--orpheus-border) p-3">
+            <h3 class="mb-2 text-xs font-medium uppercase tracking-wide text-(--orpheus-text-muted)">
+              Skills
+            </h3>
+            <p :if={@tools.skills == []} class="text-(--orpheus-text-muted)">None available.</p>
+            <ul class="flex flex-wrap gap-1.5">
+              <li
+                :for={skill <- @tools.skills}
+                class={[
+                  "rounded px-1.5 py-0.5 text-xs transition-colors",
+                  if(skill in @tools.skills_used,
+                    do: "bg-primary/20 text-primary",
+                    else: "bg-base-300 text-(--orpheus-text-secondary)"
+                  )
+                ]}
+              >
+                {skill}
+              </li>
+            </ul>
+          </div>
+        </section>
         <p class="mt-2 text-xs text-(--orpheus-text-muted)">
           Read-only. The run's conversation <code>{@run.claude_session_id}</code>
           (folder <code>{@run.folder}</code>) lives in the agent containers' volume;

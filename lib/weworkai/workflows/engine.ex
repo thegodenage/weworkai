@@ -847,6 +847,7 @@ defmodule Weworkai.Workflows.Engine do
          %{
            worktree_path: worktree.path,
            worktree_branch: worktree.branch,
+           worktree_repositories: worktree.repositories,
            review_round: 0,
            findings: []
          }}

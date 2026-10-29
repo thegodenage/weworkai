@@ -11,8 +11,33 @@ defmodule WeworkaiWeb.ConnectorsLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    {:ok, assign(socket, page_title: "Connectors")}
+    socket = assign(socket, page_title: "Connectors")
+
+    # Agents share one bridge per computer: any connected connector's tells what they reach.
+    socket =
+      if connected?(socket),
+        do: assign_async(socket, :host_tools, &load_host_tools/0),
+        else: assign(socket, host_tools: Phoenix.LiveView.AsyncResult.loading())
+
+    {:ok, socket}
   end
+
+  defp load_host_tools do
+    with %{} = connector <- Connectors.first_connected(),
+         {:ok, tools} <- Connectors.host_tools(connector) do
+      {:ok, %{host_tools: tools}}
+    else
+      nil -> {:ok, %{host_tools: nil}}
+      {:error, message} -> {:error, message}
+    end
+  end
+
+  defp tool_state(%{installed: false}), do: {"slate", "Not installed"}
+  defp tool_state(%{logged_in: false}), do: {"amber", "Not logged in"}
+  defp tool_state(%{account: account}), do: {"green", account}
+
+  defp failure_message({:error, message}) when is_binary(message), do: message
+  defp failure_message(_failure), do: "The bridge did not answer."
 
   @impl true
   def handle_params(params, _url, socket) do
@@ -330,6 +355,92 @@ defmodule WeworkaiWeb.ConnectorsLive do
         page_count={@page_count}
         path={&list_path(@filters, &1)}
       />
+
+      <section id="host-tools" class="mt-10">
+        <div class="mb-3 flex items-baseline justify-between gap-4">
+          <h2 class="text-lg font-semibold tracking-tight">What agents can use</h2>
+          <p class="text-xs text-(--orpheus-text-muted)">
+            From <code>bin/claude_bridge</code> on your computer
+          </p>
+        </div>
+        <.async_result :let={tools} assign={@host_tools}>
+          <:loading>
+            <p class="animate-pulse text-sm text-(--orpheus-text-muted)">Asking the bridge…</p>
+          </:loading>
+          <:failed :let={failure}>
+            <p id="host-tools-error" class="text-sm text-error">{failure_message(failure)}</p>
+          </:failed>
+          <p :if={!tools} class="text-sm text-(--orpheus-text-muted)">
+            Connect a connector to see the tools its agents get.
+          </p>
+          <div :if={tools} class="grid gap-4 md:grid-cols-2">
+            <div
+              id="host-tool-list"
+              class="rounded-lg border border-(--orpheus-border) p-4 transition-colors hover:border-(--orpheus-text-muted)"
+            >
+              <h3 class="mb-3 text-sm font-medium">Host tools, with your login</h3>
+              <ul class="space-y-3">
+                <li
+                  :for={tool <- tools.tools}
+                  id={"host-tool-#{tool.name}"}
+                  class="flex items-start justify-between gap-3"
+                >
+                  <div class="min-w-0">
+                    <code class="text-sm">{tool.name}</code>
+                    <p class="text-xs text-(--orpheus-text-muted)">{tool.description}</p>
+                  </div>
+                  <span class={["orpheus-badge shrink-0", "tone-#{elem(tool_state(tool), 0)}"]}>
+                    {elem(tool_state(tool), 1)}
+                  </span>
+                </li>
+              </ul>
+              <p class="mt-3 text-xs text-(--orpheus-text-muted)">
+                Every agent gets these logins and can act on GitLab as you.
+              </p>
+            </div>
+            <div
+              id="shared-claude"
+              class="rounded-lg border border-(--orpheus-border) p-4 transition-colors hover:border-(--orpheus-text-muted)"
+            >
+              <h3 class="mb-3 text-sm font-medium">From your <code>~/.claude</code></h3>
+              <p :if={tools.shared == []} class="text-sm text-(--orpheus-text-muted)">
+                Nothing to share: no CLAUDE.md, skills, agents or commands.
+              </p>
+              <dl class="space-y-2 text-sm">
+                <div :for={entry <- tools.shared} id={"shared-claude-#{entry.name}"}>
+                  <dt><code>{entry.name}</code></dt>
+                  <dd :if={entry.items != []} class="text-xs text-(--orpheus-text-secondary)">
+                    {Enum.join(entry.items, ", ")}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          </div>
+          <div
+            :if={tools}
+            id="host-tool-calls"
+            class="mt-4 rounded-lg border border-(--orpheus-border) p-4"
+          >
+            <h3 class="mb-3 text-sm font-medium">Recent host-tool calls</h3>
+            <p :if={tools.recent == []} class="text-sm text-(--orpheus-text-muted)">None yet.</p>
+            <ul class="divide-y divide-(--orpheus-border) text-sm">
+              <li
+                :for={{call, index} <- Enum.with_index(tools.recent)}
+                id={"host-tool-call-#{index}"}
+                class="flex flex-wrap items-baseline gap-x-3 py-1.5"
+              >
+                <span class="font-mono text-xs text-(--orpheus-text-muted)">
+                  {Calendar.strftime(call.at, "%b %-d, %H:%M")}
+                </span>
+                <code class="min-w-0 flex-1 truncate">{call.command}</code>
+                <span class="text-xs text-(--orpheus-text-muted)">
+                  {call.session_name} · {call.folder}
+                </span>
+              </li>
+            </ul>
+          </div>
+        </.async_result>
+      </section>
 
       <.modal :if={@form} id="connector-modal" on_cancel={JS.patch(list_path(@filters, @page_number))}>
         <:title>{if @live_action == :new, do: "New connector", else: "Edit connector"}</:title>

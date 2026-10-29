@@ -177,6 +177,7 @@ defmodule Weworkai.Board.Task do
         :assignee_id,
         :worktree_path,
         :worktree_branch,
+        :worktree_repositories,
         :current_node_id,
         :workflow_version,
         :edge_counts,
@@ -360,6 +361,14 @@ defmodule Weworkai.Board.Task do
     attribute :code_session_connector_id, :uuid, public?: true
     attribute :worktree_path, :string, public?: true
     attribute :worktree_branch, :string, public?: true
+
+    # A task on a folder of repositories: its worktree is a folder holding one worktree per
+    # repository, named here. Empty for a single repository.
+    attribute :worktree_repositories, {:array, :string} do
+      allow_nil? false
+      public? true
+      default []
+    end
 
     # The merger's last merge of the worktree branch: the branch it went into and the merge
     # commit. Cleared when the coder finishes new work.
