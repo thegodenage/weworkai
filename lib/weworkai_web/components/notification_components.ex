@@ -219,6 +219,7 @@ defmodule WeworkaiWeb.NotificationComponents do
   def kind_icon(:budget_warning), do: "hero-banknotes-micro"
   def kind_icon(:budget_reached), do: "hero-banknotes-micro"
   def kind_icon(:unblocked), do: "hero-lock-open-micro"
+  def kind_icon(:cron_failed), do: "hero-arrow-path-micro"
 
   def kind_tone(:started), do: "blue"
   def kind_tone(:plan_ready), do: "violet"
@@ -236,6 +237,7 @@ defmodule WeworkaiWeb.NotificationComponents do
   def kind_tone(:budget_warning), do: "amber"
   def kind_tone(:budget_reached), do: "red"
   def kind_tone(:unblocked), do: "green"
+  def kind_tone(:cron_failed), do: "red"
 
   @doc "How long ago, as of the last render."
   def relative_time(datetime) do

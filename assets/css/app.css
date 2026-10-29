@@ -515,6 +515,35 @@ body {
   .board-card:hover, .board-card:focus-within { translate: none; }
 }
 .board-card[data-dragging] { opacity: 0.5; scale: 0.98; }
+
+/* A group's cards in one column, drawn as a stack of cards so it never reads as one task. */
+.board-stack {
+  border-style: dashed;
+  margin: 0 6px 6px 0;
+  box-shadow:
+    3px 3px 0 -1px var(--orpheus-card),
+    3px 3px 0 0 var(--orpheus-border-strong),
+    6px 6px 0 -1px var(--orpheus-card),
+    6px 6px 0 0 var(--orpheus-border);
+  animation: board-card-in 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: box-shadow 0.2s ease, translate 0.2s ease, border-color 0.2s ease;
+}
+.board-stack:hover {
+  translate: 0 -1px;
+  border-color: var(--color-primary);
+  box-shadow:
+    4px 4px 0 -1px var(--orpheus-card),
+    4px 4px 0 0 var(--orpheus-border-strong),
+    8px 8px 0 -1px var(--orpheus-card),
+    8px 8px 0 0 var(--orpheus-border);
+}
+.board-stack[data-open=true] { border-style: solid; translate: none; }
+.board-stack[data-dragging] { opacity: 0.5; scale: 0.98; }
+.board-stack-cron { border-color: color-mix(in srgb, #38bdf8 45%, var(--orpheus-border)); }
+.board-stack-item[data-dragging] { opacity: 0.5; }
+@media (prefers-reduced-motion: reduce) {
+  .board-stack, .board-stack:hover { animation: none; translate: none; }
+}
 .board-card[data-working=queued] {
   animation: board-card-in 0.3s cubic-bezier(0.16, 1, 0.3, 1), board-breathe 2.4s ease-in-out 0.3s infinite;
 }

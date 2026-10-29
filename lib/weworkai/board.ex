@@ -3,6 +3,8 @@ defmodule Weworkai.Board do
 
   @card_fields [
     :assignee,
+    :cron,
+    :group,
     :activity,
     :current_node,
     :open_blocker_titles,
@@ -37,6 +39,14 @@ defmodule Weworkai.Board do
 
       define :search_tasks, action: :search, args: [:pattern]
       define :create_task, action: :create
+      define :create_cron_task, action: :create_from_cron
+      define :group_task, action: :set_group, args: [:group_id]
+
+      define :latest_cron_task,
+        action: :latest_for_cron,
+        args: [:cron_id],
+        not_found_error?: false
+
       define :move_task, action: :move, args: [:status]
       define :update_task, action: :update
       define :destroy_task, action: :destroy
@@ -49,6 +59,14 @@ defmodule Weworkai.Board do
       define :merge_task, action: :merge, args: [{:optional, :branch}]
       define :set_task_budget, action: :set_budget, args: [:budget_usd]
       define :upgrade_task_workflow, action: :upgrade_workflow
+    end
+
+    resource Weworkai.Board.TaskGroup do
+      define :list_task_groups, action: :list
+      define :get_task_group, action: :read, get_by: [:id]
+      define :create_task_group, action: :create, args: [:name]
+      define :create_cron_task_group, action: :create_for_cron
+      define :destroy_task_group, action: :destroy
     end
 
     resource Weworkai.Board.TaskDependency do

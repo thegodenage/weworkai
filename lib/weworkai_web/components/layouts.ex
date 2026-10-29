@@ -35,7 +35,16 @@ defmodule WeworkaiWeb.Layouts do
 
   attr :active, :atom,
     required: true,
-    values: [:dashboard, :kanban, :audit, :workflows, :employees, :connectors, :notifications]
+    values: [
+      :dashboard,
+      :kanban,
+      :audit,
+      :workflows,
+      :recurring,
+      :employees,
+      :connectors,
+      :notifications
+    ]
 
   attr :notifications, :list, required: true, doc: "recent notifications, from NotificationsHook"
   attr :unread_count, :integer, required: true, doc: "from NotificationsHook"
@@ -117,6 +126,15 @@ defmodule WeworkaiWeb.Layouts do
               active={@active == :workflows}
             >
               Workflows
+            </.nav_link>
+          </li>
+          <li>
+            <.nav_link
+              navigate={~p"/recurring"}
+              icon="hero-arrow-path"
+              active={@active == :recurring}
+            >
+              Recurring
             </.nav_link>
           </li>
           <li>

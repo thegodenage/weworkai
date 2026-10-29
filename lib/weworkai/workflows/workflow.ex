@@ -109,6 +109,8 @@ defmodule Weworkai.Workflows.Workflow do
     has_many :edges, Weworkai.Workflows.Edge
     has_many :versions, Weworkai.Workflows.Version
     has_many :tasks, Weworkai.Board.Task
+    # Crons that run it on their own (docs/recurring.md).
+    has_many :crons, Weworkai.Recurring.Cron
   end
 
   aggregates do
@@ -117,5 +119,6 @@ defmodule Weworkai.Workflows.Workflow do
     end
 
     count :task_count, :tasks
+    count :cron_count, :crons
   end
 end

@@ -72,7 +72,11 @@ const TaskDefaults = {
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
-  params: {_csrf_token: csrfToken},
+  // The browser's IANA time zone: new crons start in it.
+  params: {
+    _csrf_token: csrfToken,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  },
   hooks: {...colocatedHooks, Terminal, WorkflowEditor, TaskDefaults},
 })
 

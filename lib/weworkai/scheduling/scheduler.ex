@@ -1,6 +1,7 @@
 defmodule Weworkai.Scheduling.Scheduler do
   @moduledoc """
-  The single scheduler. Every tick it starts an agent run for each due ScheduledJob; on
+  The single scheduler. Every tick it fires the crons whose slot has come
+  (`Weworkai.Recurring.Runner`) and starts an agent run for each due ScheduledJob; on
   every SessionPoller update it closes the attempts whose agent run finished, failed or
   was stopped. Run starts, results and failures go through `Weworkai.Workflows.Engine`, which
   moves the attempt and the board task together. Logic lives in `dispatch_due/0` and
@@ -13,6 +14,7 @@ defmodule Weworkai.Scheduling.Scheduler do
 
   alias Weworkai.{Agents, ErrorText, Scheduling}
   alias Weworkai.Agents.{Budget, SessionPoller}
+  alias Weworkai.Recurring.Runner
   alias Weworkai.Scheduling.{StartFailure, Timeout}
   alias Weworkai.Workflows.Engine
 
@@ -31,6 +33,8 @@ defmodule Weworkai.Scheduling.Scheduler do
 
   @impl true
   def handle_info(:tick, state) do
+    # First, so a cron's new task has its first job dispatched in the same tick.
+    survive("starting crons", fn -> Runner.start_due() end)
     survive("a tick", &dispatch_due/0)
     skip_queued_ticks()
     {:noreply, state}

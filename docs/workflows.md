@@ -256,6 +256,9 @@ outcome carries the code reviewer's findings too):
   `plan_session_connector_id` / `code_session_connector_id` (the connector each
   conversation ran on; nil = recorded before, resumed anywhere),
   `assignee_id` (set by the engine: who works on the block the task is on).
+  `tags` (free labels; CRON on a cron's tasks), `cron_id` / `cron_run_at` (the cron that
+  created it and the slot it ran for), `group_id` (its task group, one stack per column on
+  the board; docs/recurring.md). A workflow crons run can't be deleted.
   Switching a task's workflow starts it over (place and counts cleared, its agent stopped,
   pinned to that workflow's latest version).
 - The migration seeded the default and backfilled every task with it, placing each on the

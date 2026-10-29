@@ -124,6 +124,10 @@ transaction. So a job is never left `before_start` with nothing that will pick i
 except when its previous job ends `canceled` or `failed`. Such a job waits until you
 cancel it.
 
+**Crons** (docs/recurring.md). Each tick first calls `Recurring.Runner.start_due/1`: every
+cron due creates its task and moves it to todo, whose first job the same tick's dispatch
+then picks up. It is guarded like the dispatch.
+
 **Dispatch** (`Scheduler.dispatch_due/0`, every 1s):
 
 ```mermaid
