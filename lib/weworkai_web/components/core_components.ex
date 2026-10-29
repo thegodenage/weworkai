@@ -590,10 +590,11 @@ defmodule WeworkaiWeb.CoreComponents do
   Renders markdown as sanitized HTML.
 
   `files` maps attached file names to their URLs, so `![shot.png](shot.png)` shows the attachment.
+  With `files`, an image by any other bare name shows its alt text; without, images render as is.
   """
   attr :content, :string, default: nil
   attr :class, :any, default: nil
-  attr :files, :map, default: %{}
+  attr :files, :map, default: nil
 
   def markdown(assigns) do
     ~H"""
@@ -610,6 +611,8 @@ defmodule WeworkaiWeb.CoreComponents do
 
   # Rewrites the rendered image and link targets, so code that mentions a file is left alone.
   # MDEx percent-encodes targets, so `my shot.png` arrives as `my%20shot.png`.
+  defp link_files(html, nil), do: html
+
   defp link_files(html, files) do
     files
     |> Enum.reduce(html, fn {name, url}, html ->
@@ -714,6 +717,14 @@ defmodule WeworkaiWeb.CoreComponents do
     </div>
     <script :type={Phoenix.LiveView.ColocatedHook} name=".MarkdownEditor">
       const reference = ({name}) => `![${name}](${name})`
+      const removeReference = (textarea, name) => {
+        const ref = escapeRegExp(reference({name}))
+        // Only a reference on its own line, as pasted; code that mentions it isn't one.
+        const line = new RegExp(`^${ref}\n|\n?^${ref}$`, "gm")
+        if (!line.test(textarea.value)) return
+        textarea.value = textarea.value.replace(line, "")
+        textarea.dispatchEvent(new Event("input", {bubbles: true}))
+      }
       // image/png -> .png; an extension is letters and digits only, as the server expects.
       const extension = (type) => {
         const subtype = type.split("/")[1]?.split("+")[0] ?? ""
@@ -745,7 +756,7 @@ defmodule WeworkaiWeb.CoreComponents do
             if (pasted.length === 0) return
             event.preventDefault()
             // More than the upload takes would fail the whole batch; keep the ones that fit.
-            const images = pasted.slice(0, Math.max(0, Number(this.el.dataset.uploadRoom)))
+            const images = pasted.slice(0, this.room())
             if (images.length < pasted.length) this.pushEvent("paste_skipped", {count: pasted.length - images.length})
             if (images.length === 0) return
             // Every screenshot pastes as "image.png", and a task keeps one file per name.
@@ -784,21 +795,27 @@ defmodule WeworkaiWeb.CoreComponents do
             const [from, to] = undo ? ["after", "before"] : ["before", "after"]
             const paste = this.pastes.find((p) => p[from] === previous && p[to] === textarea.value)
             if (!paste) return
-            if (undo) paste.files.forEach(({name}) => this.pushEvent("unpaste", {name}))
-            else this.upload(this.el.dataset.upload, paste.files)
+            if (undo) return paste.files.forEach(({name}) => this.pushEvent("unpaste", {name}))
+            // As on paste: keep what the upload has room for, and drop the others' references.
+            const fits = paste.files.slice(0, this.room())
+            const skipped = paste.files.slice(fits.length)
+            if (fits.length > 0) this.upload(this.el.dataset.upload, fits)
+            if (skipped.length === 0) return
+            this.pushEvent("paste_skipped", {count: skipped.length})
+            skipped.forEach(({name}) => removeReference(textarea, name))
           })
 
           // A cancelled or removed file takes its pasted reference with it.
           this.handleEvent("file-removed", ({name, task_id}) => {
             // The drawer may have moved on to another task, which keeps its references.
             if ((textarea.dataset.taskId ?? null) !== task_id) return
-            const ref = escapeRegExp(reference({name}))
-            // Only a reference on its own line, as pasted; code that mentions it isn't one.
-            const line = new RegExp(`^${ref}\n|\n?^${ref}$`, "gm")
-            if (!line.test(textarea.value)) return
-            textarea.value = textarea.value.replace(line, "")
-            textarea.dispatchEvent(new Event("input", {bubbles: true}))
+            removeReference(textarea, name)
           })
+        },
+
+        // How many more files the upload takes.
+        room() {
+          return Math.max(0, Number(this.el.dataset.uploadRoom))
         },
 
         // Replaces the selection with text, then selects from..to within it (default: cursor after it).
