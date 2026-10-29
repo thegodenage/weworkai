@@ -17,6 +17,12 @@ from `claude setup-token` saved in CLAUDE_BRIDGE_STATE/oauth-token; it reaches o
 agent containers' environment, never argv, a log or an HTTP reply. CLAUDE_AGENT_MEMORY
 (default 4g) and CLAUDE_AGENT_CPUS (default 2) limit every container.
 
+Agents also get the host's login of each HOST_TOOLS CLI (glab), by name in their
+environment like the Claude token, and a read-only copy of CLAUDE.md, skills, agents and
+commands from ~/.claude (CLAUDE_BRIDGE_CLAUDE_HOME; CLAUDE_BRIDGE_SHARE overrides the list).
+A task's folder may be a folder of repositories: its worktree then holds one worktree per
+repository (at most CLAUDE_BRIDGE_MAX_REPOS, default 20).
+
 Each run's stream lands in CLAUDE_BRIDGE_STATE (default ~/.weworkai-bridge)/runs/<id>.jsonl
 next to <id>.json (metadata), so runs outlive a bridge restart. Finished runs are deleted
 after CLAUDE_BRIDGE_KEEP_DAYS (default 7).
@@ -41,7 +47,9 @@ import sys
 import tempfile
 import threading
 import time
+import typing
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
@@ -56,6 +64,9 @@ ROOTS = [
 ]
 STATE_DIR = pathlib.Path(os.environ.get("CLAUDE_BRIDGE_STATE", "~/.weworkai-bridge")).expanduser()
 RUNS_DIR = STATE_DIR / "runs"
+# One line per host-tool call of a finished run, kept as long as runs are.
+TOOL_LOG = STATE_DIR / "tool-usage.jsonl"
+MAX_RECENT_CALLS = 50
 AGENT_TOKEN_FILE = STATE_DIR / "oauth-token"
 IMAGE_DIR = REPO_ROOT / "docker" / "agent"
 IMAGE_NAME = "weworkai-agent"
@@ -63,6 +74,16 @@ DIND_IMAGE = "docker:27.5.1-dind"
 # Conversations live here across runs; claude keys them by cwd, which is the host path.
 CONVERSATIONS_VOLUME = "weworkai-agent-claude"
 CONVERSATIONS_DIR = "/home/agent/.claude"
+CLAUDE_HOME = pathlib.Path(os.environ.get("CLAUDE_BRIDGE_CLAUDE_HOME", "~/.claude")).expanduser()
+# What of the host's ~/.claude agents get a copy of: instructions, skills, subagents and
+# commands. Never credentials, history or conversations; not settings.json, whose hooks
+# and permissions name host paths and commands, nor plugins, whose manifests do too.
+SHARED_CLAUDE = [entry for entry in os.environ.get("CLAUDE_BRIDGE_SHARE", "CLAUDE.md:skills:agents:commands").split(":")
+                 if entry and "/" not in entry and entry not in (".", "..", ".credentials.json")]
+# Project memory claude reads in the run folder's parents, which the run doesn't mount.
+PROJECT_MEMORY = ["CLAUDE.md", "CLAUDE.local.md", ".claude"]
+MAX_SHARED_BYTES = 50_000_000
+SKIPPED_NAMES = {".git", "node_modules", "__pycache__", ".venv"}
 # Loopback of the network namespace the qa agent shares with its sidecar, so no other
 # container reaches that privileged daemon.
 SIDECAR_DOCKER_HOST = "tcp://127.0.0.1:2375"
@@ -93,6 +114,9 @@ class Profile:
     git_writable: bool
     # A per-run docker:dind sidecar, never the host's Docker.
     docker: bool
+    # The host's logins of HOST_TOOLS; every role gets them. A GitLab token can write to the
+    # remote (even push over HTTPS), which no mount stops.
+    host_tools: bool = True
 
 
 # Agents may do anything inside their container; a profile only decides what it can reach.
@@ -127,6 +151,9 @@ MAX_SCHEMA = 20_000
 MAX_OUTPUT = 60_000
 MAX_DIFF = 300_000
 MAX_FOLDERS = 500
+# A task's folder may be no repository but a folder of them (~/Projects): its worktree is a
+# folder holding one worktree per repository, all on the task's branch.
+MAX_REPOSITORIES = int(os.environ.get("CLAUDE_BRIDGE_MAX_REPOS", "20"))
 MAX_TOOL_SUMMARY = 160
 
 meta_lock = threading.Lock()
@@ -137,6 +164,8 @@ image_builder = None
 # Held from the "still running" check until the new run's metadata exists, so two starts
 # resuming one conversation can't both pass the check.
 start_lock = threading.Lock()
+# The reaper and a listing may both find a run ended; one of them settles it.
+settle_lock = threading.Lock()
 # Finished runs never change again, so the 2s session listing reads each one's file once.
 finished_runs = {}
 last_prune = 0.0
@@ -264,11 +293,14 @@ def claude_argv(request, conversation_id):
 class Mount:
     path: pathlib.Path
     read_only: bool
+    # Where it shows in the container; the same path as on the host when None.
+    target: str | None = None
 
     def flags(self):
         # Same path inside as on the host: a worktree's .git file and claude's per-cwd
         # conversations both name host paths.
-        return ["--mount", f"type=bind,source={self.path},target={self.path}" + (",readonly" if self.read_only else "")]
+        return ["--mount", f"type=bind,source={self.path},target={self.target or self.path}"
+                + (",readonly" if self.read_only else "")]
 
 
 def git_directory(folder):
@@ -277,17 +309,32 @@ def git_directory(folder):
     return pathlib.Path(completed.stdout.strip()).resolve() if completed.returncode == 0 else None
 
 
-def mounts(folder, profile, git_dir):
+def child_repositories(folder):
+    """The git repositories (or worktrees) directly inside `folder`: no symlinks, no hidden folders."""
+    return [child for child in sorted(folder.iterdir(), key=lambda child: child.name.lower())
+            if child.is_dir() and not child.is_symlink() and not child.name.startswith(".")
+            and (child / ".git").exists()]
+
+
+def git_directories(folder):
+    """The shared git directories a run in `folder` uses: its repository's, or those of the
+    repositories directly in it (a folder of repositories, or a headless worktree)."""
+    own = git_directory(folder)
+    if own is not None:
+        return [own]
+    return [git_dir for child in child_repositories(folder) for git_dir in [git_directory(child)] if git_dir]
+
+
+def mounts(folder, profile, git_dirs):
     result = [Mount(folder, read_only=not profile.folder_writable)]
-    if git_dir is None:
-        return result
-    inside = folder in git_dir.parents
-    if not inside or (profile.folder_writable and not profile.git_writable):
-        result.append(Mount(git_dir, read_only=not profile.git_writable))
-    if profile.git_writable:
-        # git runs hooks and config-named commands (core.fsmonitor, filters) on the host
-        # too, so an agent that could rewrite these would run code outside its container.
-        result += [Mount(git_dir / "config", read_only=True), Mount(git_dir / "hooks", read_only=True)]
+    for git_dir in git_dirs:
+        inside = folder in git_dir.parents
+        if not inside or (profile.folder_writable and not profile.git_writable):
+            result.append(Mount(git_dir, read_only=not profile.git_writable))
+        if profile.git_writable:
+            # git runs hooks and config-named commands (core.fsmonitor, filters) on the host
+            # too, so an agent that could rewrite these would run code outside its container.
+            result += [Mount(git_dir / "config", read_only=True), Mount(git_dir / "hooks", read_only=True)]
     return result
 
 
@@ -347,6 +394,99 @@ def agent_token():
     return token.group(0)
 
 
+def host_output(*argv):
+    completed = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def glab_login():
+    """The host's glab login as glab's own variables: its default host and that host's token."""
+    if shutil.which("glab") is None:
+        return None
+    host = host_output("glab", "config", "get", "host") or "gitlab.com"
+    token = host_output("glab", "config", "get", "token", "--host", host)
+    return host, ({"GITLAB_HOST": host, "GITLAB_TOKEN": token} if token else {})
+
+
+@dataclasses.dataclass(frozen=True)
+class HostTool:
+    description: str
+    # (account, environment) of the login on this computer, None when not installed.
+    login: typing.Callable[[], tuple[str, dict[str, str]] | None]
+
+
+# CLIs in the agent image (docker/agent/Dockerfile) that act as the host user: their login
+# here reaches agent containers as environment variables, by name only, like the Claude token.
+HOST_TOOLS = {
+    "glab": HostTool("GitLab CLI: merge requests, issues, pipelines, activity, the API", glab_login),
+}
+# A host tool run by a Bash call: at the start or after a separator, never inside a word.
+HOST_TOOL_COMMAND = re.compile(r"(?:^|[\s;&|(`])(" + "|".join(map(re.escape, HOST_TOOLS)) + r")(?=$|[\s;&|)])")
+
+
+def host_tool_logins():
+    return {name: tool.login() for name, tool in HOST_TOOLS.items()}
+
+
+def host_tool_status(logins):
+    return [{"name": name, "description": HOST_TOOLS[name].description, "installed": login is not None,
+             "loggedIn": bool(login and login[1]), "account": login[0] if login else None}
+            for name, login in logins.items()]
+
+
+def tree_size(path):
+    """Bytes under `path` as share_claude_home copies it: symlinks followed, SKIPPED_NAMES left out."""
+    if not path.is_dir():
+        return path.stat().st_size
+    total = 0
+    for root, folders, files in os.walk(path, followlinks=True):
+        folders[:] = [folder for folder in folders if folder not in SKIPPED_NAMES]
+        total += sum(os.path.getsize(os.path.join(root, name)) for name in files
+                     if os.path.exists(os.path.join(root, name)))
+    return total
+
+
+def share_claude_home(run_id):
+    """Copies the shared parts of the host's ~/.claude, symlinks followed, to the run's own
+    folder and returns their read-only mounts into the agent's ~/.claude."""
+    copy = RUNS_DIR / f"{run_id}.claude"
+    shared = []
+    for entry in SHARED_CLAUDE:
+        source = CLAUDE_HOME / entry
+        if not source.exists():
+            continue
+        if tree_size(source) > MAX_SHARED_BYTES:
+            print(f"claude_bridge: not sharing {short_path(source)}: over {MAX_SHARED_BYTES // 1_000_000} MB",
+                  flush=True)
+            continue
+        target = copy / entry
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target, symlinks=False, ignore=shutil.ignore_patterns(*SKIPPED_NAMES),
+                            ignore_dangling_symlinks=True)
+        else:
+            shutil.copyfile(source, target)
+        shared.append(Mount(target, read_only=True, target=f"{CONVERSATIONS_DIR}/{entry}"))
+    return shared
+
+
+def shared_claude_entries():
+    """Each shared entry of the host's ~/.claude, with a folder's contents (skill names, …)."""
+    return [{"name": entry,
+             "items": sorted(child.name for child in (CLAUDE_HOME / entry).iterdir() if not child.name.startswith("."))
+             if (CLAUDE_HOME / entry).is_dir() else []}
+            for entry in SHARED_CLAUDE if (CLAUDE_HOME / entry).exists()]
+
+
+def project_memory(folder):
+    """Read-only mounts of the CLAUDE.md files and .claude folders in the run folder's parents
+    inside an allowed root (not the home folder, whose .claude share_claude_home covers)."""
+    home = pathlib.Path.home()
+    return [Mount(parent / name, read_only=True) for parent in folder.parents
+            if parent != home and any(parent == root or root in parent.parents for root in ROOTS)
+            for name in PROJECT_MEMORY if (parent / name).exists()]
+
+
 def docker(*args, timeout=60):
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
 
@@ -400,17 +540,21 @@ def require_image():
 
 def tool_summary(name, tool_input):
     key = {"Bash": "command", "Read": "file_path", "Write": "file_path", "Edit": "file_path",
-           "Grep": "pattern", "Glob": "pattern", "Task": "description"}.get(name)
+           "Grep": "pattern", "Glob": "pattern", "Task": "description", "Skill": "skill"}.get(name)
     detail = tool_input.get(key) if key else json.dumps(tool_input)
     return f"→ {name}: {str(detail).splitlines()[0] if detail else ''}"[:MAX_TOOL_SUMMARY]
+
+
+def content_blocks(event):
+    message = event.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    return [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
 
 
 def render(events):
     lines = []
     for event in events:
-        message = event.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+        blocks = content_blocks(event)
         if event.get("subtype") == "permission_denied":
             lines.append(f"  ✗ {event.get('tool_name')} denied: not allowed for this agent")
         elif event.get("type") == "assistant":
@@ -432,6 +576,60 @@ def render(events):
                 lines.append(str(event["result"]))
     text = "\n".join(lines)
     return text[-MAX_OUTPUT:]
+
+
+def host_tool_calls(command):
+    """(tool, the command's line that runs it) for each host tool a Bash command runs."""
+    lines = command.strip().splitlines()
+    return [(tool, next(line for line in lines if any(match.group(1) == tool
+                                                      for match in HOST_TOOL_COMMAND.finditer(line)))[:MAX_TOOL_SUMMARY])
+            for tool in sorted({match.group(1) for match in HOST_TOOL_COMMAND.finditer(command)})]
+
+
+def tool_usage(meta, events):
+    """What the run could use (claude's init event, the host tools and ~/.claude parts it got)
+    and what it used: calls per tool, the skills it ran and each host-tool command."""
+    init = next((event for event in events if event.get("type") == "system" and event.get("subtype") == "init"), {})
+    calls, skills, host_calls = Counter(), [], []
+    for event in events:
+        if event.get("type") != "assistant":
+            continue
+        for block in content_blocks(event):
+            name, tool_input = block.get("name"), block.get("input") or {}
+            if block.get("type") != "tool_use" or name == "StructuredOutput":
+                continue
+            calls[name] += 1
+            if name == "Skill" and tool_input.get("skill"):
+                skills.append(str(tool_input["skill"]))
+            if name == "Bash" and isinstance(tool_input.get("command"), str):
+                host_calls += [{"tool": tool, "command": line} for tool, line in host_tool_calls(tool_input["command"])]
+    return {
+        "available": {"tools": init.get("tools") or [], "skills": init.get("skills") or [],
+                      "hostTools": meta.get("hostTools") or [], "sharedClaude": meta.get("sharedClaude") or []},
+        "calls": dict(calls),
+        "skills": skills,
+        "hostCalls": host_calls,
+    }
+
+
+def log_tool_usage(meta, events):
+    """Appends a finished run's host-tool calls to TOOL_LOG and names them on stdout."""
+    calls = tool_usage(meta, events)["hostCalls"]
+    if not calls:
+        return
+    at = datetime.now(timezone.utc).isoformat()
+    TOOL_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with TOOL_LOG.open("a") as log:
+        for call in calls:
+            log.write(json.dumps({"at": at, "run": meta["id"], "name": meta.get("name"), "cwd": meta.get("cwd"),
+                                  **call}) + "\n")
+    counts = Counter(call["tool"] for call in calls)
+    print(f"claude_bridge: run {meta['id']} ({meta.get('name')}) used "
+          + ", ".join(f"{tool} ×{count}" for tool, count in sorted(counts.items())), flush=True)
+
+
+def recent_tool_calls():
+    return read_events(TOOL_LOG)[-MAX_RECENT_CALLS:][::-1]
 
 
 def read_events(path):
@@ -518,10 +716,18 @@ def settle(run_id, meta):
         return meta
     if not meta.get("stopped") and run_alive(run_id, meta):
         return {**meta, "status": "running"}
-    remove_containers(meta.get("sidecar"))
-    result = result_event(read_events(run_paths(run_id)[1]))
-    return update_meta(run_id, status=final_status(meta, result),
-                       costUsd=(result or {}).get("total_cost_usd"))
+    with settle_lock:
+        meta = read_meta(run_id)
+        if finished(meta):
+            return meta
+        remove_containers(meta.get("sidecar"))
+        shutil.rmtree(RUNS_DIR / f"{run_id}.claude", ignore_errors=True)
+        events = read_events(run_paths(run_id)[1])
+        result = result_event(events)
+        meta = update_meta(run_id, status=final_status(meta, result),
+                           costUsd=(result or {}).get("total_cost_usd"))
+        log_tool_usage(meta, events)
+        return meta
 
 
 def summary(meta):
@@ -566,8 +772,15 @@ def prune_runs(now):
         # A finished run's metadata is last written when it settles.
         if finished(meta) and now - meta_path.stat().st_mtime > KEEP_SECONDS:
             for path in RUNS_DIR.glob(f"{meta['id']}.*"):
-                path.unlink(missing_ok=True)
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
             finished_runs.pop(meta["id"], None)
+    if TOOL_LOG.exists():
+        cutoff = datetime.fromtimestamp(now - KEEP_SECONDS, timezone.utc).isoformat()
+        kept = [call for call in read_events(TOOL_LOG) if str(call.get("at", "")) >= cutoff]
+        TOOL_LOG.write_text("".join(json.dumps(call) + "\n" for call in kept))
 
 
 def list_sessions(_body):
@@ -607,6 +820,7 @@ def show_session(_body, run_id):
         "claudeSessionId": meta["claudeSessionId"],
         "costUsd": result.get("total_cost_usd"),
         "usage": usage(final),
+        "tools": tool_usage(meta, events),
     }
 
 
@@ -668,14 +882,18 @@ def spawn(request, conversation_id, token, image):
     write_attachments(request.cwd, request.attachments)
     run_id = secrets.token_hex(4)
     profile = PROFILES[request.profile]
-    git_dir = git_directory(request.cwd)
-    if git_dir is not None and profile.git_writable:
-        # A bind mount needs its source; Docker would otherwise create it owned by root.
-        (git_dir / "hooks").mkdir(exist_ok=True)
-    environment = {"CLAUDE_CODE_OAUTH_TOKEN": token, **git_identity(request.cwd)}
+    git_dirs = git_directories(request.cwd)
+    if profile.git_writable:
+        for git_dir in git_dirs:
+            # A bind mount needs its source; Docker would otherwise create it owned by root.
+            (git_dir / "hooks").mkdir(exist_ok=True)
+    logins = host_tool_logins() if profile.host_tools else {}
+    host_environment = {key: value for login in logins.values() if login for key, value in login[1].items()}
+    environment = {"CLAUDE_CODE_OAUTH_TOKEN": token, **git_identity(request.cwd), **host_environment}
     sidecar = start_sidecar(run_id) if profile.docker else None
-    argv = docker_argv(run_id, request, conversation_id, image, mounts(request.cwd, profile, git_dir), sidecar,
-                       environment.keys())
+    shared = share_claude_home(run_id)
+    run_mounts = [*mounts(request.cwd, profile, git_dirs), *project_memory(request.cwd), *shared]
+    argv = docker_argv(run_id, request, conversation_id, image, run_mounts, sidecar, environment.keys())
     meta_path, log_path = run_paths(run_id)
     prompt_path = RUNS_DIR / f"{run_id}.prompt"
     prompt_path.write_text(request.prompt)
@@ -691,6 +909,8 @@ def spawn(request, conversation_id, token, image):
         "id": run_id, "name": request.name, "cwd": str(request.cwd), "profile": request.profile,
         "startedAt": datetime.now(timezone.utc).isoformat(), "pid": process.pid,
         "container": container_name(run_id), "sidecar": sidecar, "claudeSessionId": conversation_id,
+        "hostTools": sorted(name for name, login in logins.items() if login and login[1]),
+        "sharedClaude": [mount.target.rsplit("/", 1)[-1] for mount in shared],
     }))
     return run_id, process
 
@@ -731,12 +951,28 @@ def create_worktree(body):
     name = text_field(body, "name", 40)
     if not WORKTREE_NAME.match(name):
         raise Rejected(422, "invalid worktree name")
-    if git(repo, "rev-parse", "--show-toplevel").stdout.strip() != str(repo):
-        raise Rejected(422, f"{repo} is not the root of a git repository")
-
-    exclude_state_folder(repo)
     path = repo / ".weworkai" / "worktrees" / name
     branch = f"weworkai/{name}"
+    toplevel = git(repo, "rev-parse", "--show-toplevel").stdout.strip()
+    if toplevel == str(repo):
+        exclude_state_folder(repo)
+        return {"path": str(path), "branch": branch, "base": add_worktree(repo, path, branch), "repositories": []}
+    repositories = [] if toplevel else child_repositories(repo)
+    if not repositories:
+        raise Rejected(422, f"{repo} is neither the root of a git repository nor a folder of them")
+    if len(repositories) > MAX_REPOSITORIES:
+        raise Rejected(422, f"{repo} holds {len(repositories)} git repositories; a worktree across them takes at "
+                            f"most {MAX_REPOSITORIES} (CLAUDE_BRIDGE_MAX_REPOS). Pick a folder with fewer")
+    path.mkdir(parents=True, exist_ok=True)
+    for child in repositories:
+        add_worktree(child, path / child.name, branch)
+    return {"path": str(path), "branch": branch, "base": None,
+            "repositories": [child.name for child in repositories]}
+
+
+def add_worktree(repo, path, branch):
+    """A worktree of `repo` at `path` on `branch` (from the repo's current commit unless the
+    branch exists); one already there is kept. Returns the commit the branch started from."""
     if not path.exists():
         branch_exists = git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
         head = git_output(repo, "rev-parse", "HEAD")
@@ -746,21 +982,31 @@ def create_worktree(body):
             git_output(repo, "worktree", "add", "-b", branch, str(path), head)
         if git(repo, "config", "--get", base_key(branch)).returncode != 0:
             git_output(repo, "config", base_key(branch), head)
-    return {"path": str(path), "branch": branch, "base": git_output(repo, "config", "--get", base_key(branch))}
+    return git_output(repo, "config", "--get", base_key(branch))
 
 
 def worktree_diff(body):
     path = allowed_folder(text_field(body, "path", 1000))
     if path.parent.name != "worktrees" or path.parent.parent.name != ".weworkai":
         raise Rejected(422, f"{path} is not a weworkai worktree")
-    branch = git_output(path, "rev-parse", "--abbrev-ref", "HEAD")
-    base = git_output(path, "config", "--get", base_key(branch))
-    # Against the working tree, so committed and uncommitted changes both show.
-    parts = [git_output(path, "diff", base)]
-    for untracked in git_output(path, "ls-files", "--others", "--exclude-standard").splitlines():
-        parts.append(git(path, "diff", "--no-index", "--", "/dev/null", untracked).stdout.strip())
-    diff = "\n".join(part for part in parts if part)
+    if (path / ".git").exists():
+        diff = branch_diff(path)
+    else:
+        # A headless worktree: each repository's changes, its paths under the repository's name.
+        diff = "\n".join(part for child in child_repositories(path) for part in [branch_diff(child, f"{child.name}/")]
+                         if part)
     return {"diff": diff[:MAX_DIFF], "truncated": len(diff) > MAX_DIFF}
+
+
+def branch_diff(worktree, prefix=""):
+    branch = git_output(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    base = git_output(worktree, "config", "--get", base_key(branch))
+    prefixes = [f"--src-prefix=a/{prefix}", f"--dst-prefix=b/{prefix}"]
+    # Against the working tree, so committed and uncommitted changes both show.
+    parts = [git_output(worktree, "diff", *prefixes, base)]
+    for untracked in git_output(worktree, "ls-files", "--others", "--exclude-standard").splitlines():
+        parts.append(git(worktree, "diff", "--no-index", *prefixes, "--", "/dev/null", untracked).stdout.strip())
+    return "\n".join(part for part in parts if part)
 
 
 def list_folders(body):
@@ -793,9 +1039,16 @@ def models(_body):
     return {"version": agent_version(), "models": MODELS, "efforts": EFFORTS}
 
 
+def list_tools(_body):
+    """What agents reach beyond their folder: host tools, the shared ~/.claude, recent host-tool calls."""
+    return {"hostTools": host_tool_status(host_tool_logins()), "claudeHome": shared_claude_entries(),
+            "recent": recent_tool_calls()}
+
+
 GET_ROUTES = [
     (re.compile(r"^/auth/status$"), auth_status),
     (re.compile(r"^/models$"), models),
+    (re.compile(r"^/tools$"), list_tools),
     (re.compile(r"^/sessions$"), list_sessions),
     (re.compile(r"^/sessions/([0-9a-f]{8})$"), show_session),
     (re.compile(r"^/worktrees/diff$"), worktree_diff),
@@ -916,13 +1169,19 @@ def scratch_repository(scratch):
 
 
 def self_test():
-    global ROOTS, RUNS_DIR, AGENT_TOKEN_FILE, docker
+    global ROOTS, RUNS_DIR, AGENT_TOKEN_FILE, CLAUDE_HOME, TOOL_LOG, docker
     real_docker = docker
+    real_glab = HOST_TOOLS["glab"]
     with tempfile.TemporaryDirectory() as scratch:
         scratch = pathlib.Path(scratch).resolve()
         ROOTS = [scratch]
         RUNS_DIR = scratch / "runs"
+        RUNS_DIR.mkdir()
         AGENT_TOKEN_FILE = scratch / "oauth-token"
+        CLAUDE_HOME = scratch / "no-claude-home"
+        TOOL_LOG = scratch / "tool-usage.jsonl"
+        HOST_TOOLS["glab"] = HostTool("GitLab CLI", lambda: ("gitlab.example.com", {
+            "GITLAB_HOST": "gitlab.example.com", "GITLAB_TOKEN": "glpat-secret"}))
         body = {"name": "cph-abcdefgh", "cwd": str(scratch), "model": "haiku", "prompt": "-x Plan it",
                 "profile": "planner", "effort": "low", "jsonSchema": {"type": "object"}}
         conversation = str(uuid.uuid4())
@@ -962,6 +1221,9 @@ def self_test():
                 raise AssertionError(f"accepted {bad}")
 
         test_docker_argv(scratch, body, conversation)
+        test_headless(scratch)
+        test_shared_claude(scratch)
+        test_tool_usage()
         test_prerequisites()
         test_folders(scratch)
 
@@ -1047,12 +1309,14 @@ def self_test():
             test_containers(conversation)
         finally:
             docker = real_docker
+            HOST_TOOLS["glab"] = real_glab
     print("claude_bridge self-test passed")
 
 
 def test_docker_argv(scratch, body, conversation):
     repo, worktree = scratch_repository(scratch)
     git_dir = git_directory(worktree)
+    assert git_directories(worktree) == [git_dir] and git_directories(scratch) == [git_dir]
     assert git_dir == repo / ".git" and git_directory(repo) == git_dir and git_directory(scratch) is None
     identity = git_identity(worktree)
     assert identity == {"GIT_AUTHOR_NAME": "Ada Lovelace", "GIT_AUTHOR_EMAIL": "ada@example.com",
@@ -1061,7 +1325,7 @@ def test_docker_argv(scratch, body, conversation):
 
     def argv(profile, folder, sidecar=None):
         request = RunRequest.parse({**body, "profile": profile, "cwd": str(folder)})
-        run_mounts = mounts(request.cwd, PROFILES[profile], git_directory(request.cwd))
+        run_mounts = mounts(request.cwd, PROFILES[profile], git_directories(request.cwd))
         return docker_argv("0123abcd", request, conversation, "weworkai-agent:test", run_mounts, sidecar, names)
 
     def bind(path, read_only):
@@ -1088,7 +1352,9 @@ def test_docker_argv(scratch, body, conversation):
         bind(git_dir / "hooks", True)], mount_flags(argv("coder", worktree))
     assert mount_flags(argv("custom", repo)) == [
         volume, bind(repo, False), bind(git_dir / "config", True), bind(git_dir / "hooks", True)]
-    assert mount_flags(argv("custom", scratch)) == [volume, bind(scratch, False)]
+    # The repositories in a folder keep their config and hooks read-only too.
+    assert mount_flags(argv("custom", scratch)) == [
+        volume, bind(scratch, False), bind(git_dir / "config", True), bind(git_dir / "hooks", True)]
     assert mount_flags(argv("merger", repo)) == [
         volume, bind(repo, False), bind(git_dir / "config", True), bind(git_dir / "hooks", True)]
 
@@ -1100,6 +1366,110 @@ def test_docker_argv(scratch, body, conversation):
     assert sidecar[:6] == ["docker", "run", "--detach", "--rm", "--privileged", "--name"], sidecar
     assert sidecar[sidecar.index("--name") + 1] == "cph-0123abcd-dind"
     assert sidecar[sidecar.index(DIND_IMAGE) + 1:] == ["dockerd", "--host=tcp://127.0.0.1:2375", "--tls=false"]
+
+    (repo / "CLAUDE.md").write_text("Repo rules.")
+    assert project_memory(worktree) == [Mount(repo / "CLAUDE.md", read_only=True)], project_memory(worktree)
+    assert project_memory(scratch) == []
+    (repo / "CLAUDE.md").unlink()
+    shared = Mount(scratch / "skills", read_only=True, target=f"{CONVERSATIONS_DIR}/skills")
+    assert shared.flags() == ["--mount", f"type=bind,source={scratch / 'skills'},target={CONVERSATIONS_DIR}/skills,readonly"]
+
+
+def test_headless(scratch):
+    workspace = scratch / "workspace"
+    for name in ("api", "web"):
+        repo = workspace / name
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], capture_output=True, check=True)
+        git_output(repo, "config", "user.name", "Ada Lovelace")
+        git_output(repo, "config", "user.email", "ada@example.com")
+        (repo / "README.md").write_text(name)
+        git_output(repo, "add", ".")
+        git_output(repo, "commit", "-q", "-m", "init")
+    (workspace / "notes").mkdir()
+    headless = workspace / ".weworkai" / "worktrees" / "abcd1234"
+    created = create_worktree({"repo": str(workspace), "name": "abcd1234"})
+    assert created == {"path": str(headless), "branch": "weworkai/abcd1234", "base": None,
+                       "repositories": ["api", "web"]}, created
+    assert create_worktree({"repo": str(workspace), "name": "abcd1234"}) == created
+    assert git_output(headless / "api", "rev-parse", "--abbrev-ref", "HEAD") == "weworkai/abcd1234"
+
+    (headless / "api" / "README.md").write_text("api v2")
+    (headless / "web" / "new.txt").write_text("x")
+    diff = worktree_diff({"path": str(headless)})["diff"]
+    assert "+++ b/api/README.md" in diff and "+++ b/web/new.txt" in diff, diff
+
+    git_dirs = git_directories(headless)
+    assert git_dirs == [workspace / "api" / ".git", workspace / "web" / ".git"], git_dirs
+    coder = mounts(headless, PROFILES["coder"], git_dirs)
+    assert Mount(workspace / "api" / ".git", read_only=False) in coder, coder
+    assert Mount(workspace / "web" / ".git" / "hooks", read_only=True) in coder, coder
+    reviewer = mounts(headless, PROFILES["reviewer"], git_dirs)
+    assert Mount(workspace / "api" / ".git", read_only=True) in reviewer, reviewer
+    for bad in [workspace / "notes", workspace / "api" / ".weworkai"]:
+        bad.mkdir(exist_ok=True)
+        try:
+            create_worktree({"repo": str(bad), "name": "abcd1234"})
+        except Rejected as error:
+            assert error.code == 422
+        else:
+            raise AssertionError(f"made a worktree of {bad}")
+
+
+def test_shared_claude(scratch):
+    global CLAUDE_HOME
+    CLAUDE_HOME = scratch / "claude-home"
+    (CLAUDE_HOME / "skills" / "release-notes").mkdir(parents=True)
+    (CLAUDE_HOME / "skills" / "release-notes" / "SKILL.md").write_text("---\nname: release-notes\n---\n")
+    (CLAUDE_HOME / "CLAUDE.md").write_text("Be brief.")
+    (CLAUDE_HOME / ".credentials.json").write_text("{}")
+    (CLAUDE_HOME / "settings.json").write_text("{}")
+    elsewhere = scratch / "linked-skill"
+    elsewhere.mkdir()
+    (elsewhere / "SKILL.md").write_text("linked")
+    (CLAUDE_HOME / "skills" / "linked").symlink_to(elsewhere)
+    try:
+        shared = share_claude_home("0123abcd")
+        copy = RUNS_DIR / "0123abcd.claude"
+        assert shared == [Mount(copy / "CLAUDE.md", True, f"{CONVERSATIONS_DIR}/CLAUDE.md"),
+                          Mount(copy / "skills", True, f"{CONVERSATIONS_DIR}/skills")], shared
+        linked = copy / "skills" / "linked"
+        assert not linked.is_symlink() and (linked / "SKILL.md").read_text() == "linked"
+        assert not (copy / ".credentials.json").exists() and not (copy / "settings.json").exists()
+        assert shared_claude_entries() == [{"name": "CLAUDE.md", "items": []},
+                                           {"name": "skills", "items": ["linked", "release-notes"]}]
+        shutil.rmtree(copy)
+    finally:
+        CLAUDE_HOME = scratch / "no-claude-home"
+
+
+def test_tool_usage():
+    meta = {"id": "0123abcd", "name": "cph-abcdefgh", "cwd": "/x", "hostTools": ["glab"], "sharedClaude": ["skills"]}
+    events = [
+        {"type": "system", "subtype": "init", "tools": ["Bash", "Skill"], "skills": ["release-notes"]},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "cd api && glab mr list --author=@me"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "git log --grep glabber"}},
+            {"type": "tool_use", "name": "Skill", "input": {"skill": "release-notes"}},
+            {"type": "tool_use", "name": "StructuredOutput", "input": {}}]}},
+    ]
+    tools = tool_usage(meta, events)
+    assert tools == {
+        "available": {"tools": ["Bash", "Skill"], "skills": ["release-notes"], "hostTools": ["glab"],
+                      "sharedClaude": ["skills"]},
+        "calls": {"Bash": 2, "Skill": 1},
+        "skills": ["release-notes"],
+        "hostCalls": [{"tool": "glab", "command": "cd api && glab mr list --author=@me"}],
+    }, tools
+    # The line that runs it, not an earlier one that only mentions it.
+    assert host_tool_calls("echo glabber\nglab api /events") == [("glab", "glab api /events")]
+    assert tool_usage({}, [])["available"] == {"tools": [], "skills": [], "hostTools": [], "sharedClaude": []}
+    log_tool_usage(meta, events)
+    assert [(call["run"], call["tool"]) for call in recent_tool_calls()] == [("0123abcd", "glab")]
+    assert host_tool_status(host_tool_logins()) == [{"name": "glab", "description": "GitLab CLI", "installed": True,
+                                                     "loggedIn": True, "account": "gitlab.example.com"}]
+    # Every role gets the host logins.
+    assert all(profile.host_tools for profile in PROFILES.values())
 
 
 def test_folders(scratch):
@@ -1216,10 +1586,14 @@ def test_runs(scratch, body, conversation):
     # The token reaches docker's environment, by name in argv only.
     assert popen_environments[0]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-secret"
     assert "CLAUDE_CODE_OAUTH_TOKEN" in calls[0][-1] and "sk-ant" not in repr(calls[0][:-1]), calls[0]
+    # So does the host's GitLab login.
+    assert popen_environments[0]["GITLAB_TOKEN"] == "glpat-secret"
+    assert "GITLAB_TOKEN" in calls[0][-1] and "glpat" not in repr(calls[0][:-1]), calls[0]
     assert not list(RUNS_DIR.glob("*.prompt")), "the prompt file outlived the start"
     meta = read_meta(run_id)
     assert meta["container"] == f"cph-{run_id}" and meta["sidecar"] is None
-    assert "sk-ant" not in run_paths(run_id)[0].read_text()
+    assert meta["hostTools"] == ["glab"] and meta["sharedClaude"] == []
+    assert "sk-ant" not in run_paths(run_id)[0].read_text() and "glpat" not in run_paths(run_id)[0].read_text()
     wait_until(lambda: current_meta(run_id)["status"] != "running")
     assert run_paths(run_id)[1].read_text() == body["prompt"]
     assert run_id not in children
@@ -1287,5 +1661,9 @@ if __name__ == "__main__":
     if not AGENT_TOKEN_FILE.exists():
         print(f"claude_bridge: agents cannot start until you run `claude setup-token` and save the token to "
               f"{short_path(AGENT_TOKEN_FILE)} (chmod 600)", flush=True)
+    for tool in host_tool_status(host_tool_logins()):
+        state = (f"logged in to {tool['account']}" if tool["loggedIn"] else "not logged in") if tool["installed"] \
+            else "not installed"
+        print(f"claude_bridge: host tool {tool['name']}: {state}", flush=True)
     print(f"claude_bridge listening on 127.0.0.1:{PORT}; agents may run under {', '.join(map(str, ROOTS))}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
