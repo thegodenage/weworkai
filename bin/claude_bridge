@@ -395,7 +395,12 @@ def agent_token():
 
 
 def host_output(*argv):
-    completed = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
+    """The command's output, or "" when it fails or hangs (a keyring prompt): host tools are
+    an extra, so a broken one never keeps runs from starting."""
+    try:
+        completed = subprocess.run(list(argv), capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
@@ -910,17 +915,25 @@ def spawn(request, conversation_id, token, image):
     host_environment = {key: value for login in logins.values() if login for key, value in login[1].items()}
     environment = {"CLAUDE_CODE_OAUTH_TOKEN": token, **git_identity(request.cwd), **host_environment}
     sidecar = start_sidecar(run_id) if profile.docker else None
-    shared = share_claude_home(run_id)
-    run_mounts = [*mounts(request.cwd, profile, git_dirs), *project_memory(request.cwd), *shared]
-    argv = docker_argv(run_id, request, conversation_id, image, run_mounts, sidecar, environment.keys())
     meta_path, log_path = run_paths(run_id)
     prompt_path = RUNS_DIR / f"{run_id}.prompt"
-    prompt_path.write_text(request.prompt)
-    with (prompt_path.open("rb") as prompt, log_path.open("wb") as log,
-          (RUNS_DIR / f"{run_id}.err").open("wb") as errors):
-        # Own session, so `docker run` outlives a bridge restart and keeps writing the log.
-        process = subprocess.Popen(argv, stdin=prompt, stdout=log, stderr=errors, start_new_session=True,
-                                   env={**os.environ, **environment})
+    try:
+        shared = share_claude_home(run_id)
+        run_mounts = [*mounts(request.cwd, profile, git_dirs), *project_memory(request.cwd), *shared]
+        argv = docker_argv(run_id, request, conversation_id, image, run_mounts, sidecar, environment.keys())
+        prompt_path.write_text(request.prompt)
+        with (prompt_path.open("rb") as prompt, log_path.open("wb") as log,
+              (RUNS_DIR / f"{run_id}.err").open("wb") as errors):
+            # Own session, so `docker run` outlives a bridge restart and keeps writing the log.
+            process = subprocess.Popen(argv, stdin=prompt, stdout=log, stderr=errors, start_new_session=True,
+                                       env={**os.environ, **environment})
+    except BaseException:
+        # No metadata yet, so neither settle nor prune_runs would ever find what's left.
+        shutil.rmtree(RUNS_DIR / f"{run_id}.claude", ignore_errors=True)
+        for path in (prompt_path, log_path, RUNS_DIR / f"{run_id}.err"):
+            path.unlink(missing_ok=True)
+        remove_containers(sidecar)
+        raise
     children[run_id] = process
     # docker holds its own descriptor of the prompt, so the file itself is no longer needed.
     prompt_path.unlink()
@@ -1497,6 +1510,14 @@ def test_tool_usage():
         log.write(json.dumps({"at": "2000-01-01T00:00:00+00:00", "run": "00000000", "tool": "glab"}) + "\n")
     prune_runs(time.time())
     assert [call["run"] for call in recent_tool_calls()] == ["0123abcd"]
+    # A host tool that hangs or is gone yields no login rather than an error.
+    real_run = subprocess.run
+    subprocess.run = lambda argv, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(argv, 10))
+    try:
+        assert host_output("glab", "config", "get", "host") == ""
+    finally:
+        subprocess.run = real_run
+    assert host_output("/nonexistent/glab", "config", "get", "host") == ""
     assert host_tool_status(host_tool_logins()) == [{"name": "glab", "description": "GitLab CLI", "installed": True,
                                                      "loggedIn": True, "account": "gitlab.example.com"}]
     # Every role gets the host logins.
@@ -1602,6 +1623,28 @@ def test_runs(scratch, body, conversation):
         docker_argv = real_argv
     assert forked["claudeSessionId"] != conversation, forked
     wait_until(lambda: current_meta(forked["id"])["status"] != "running")
+
+    # A start that fails before its metadata exists leaves nothing behind in RUNS_DIR.
+    global CLAUDE_HOME
+    CLAUDE_HOME = scratch / "failing-claude-home"
+    (CLAUDE_HOME / "skills" / "x").mkdir(parents=True)
+    (CLAUDE_HOME / "skills" / "x" / "SKILL.md").write_text("x")
+    before = set(RUNS_DIR.iterdir())
+
+    def broken_argv(*args):
+        raise OSError("docker vanished")
+
+    docker_argv = broken_argv
+    try:
+        start_session(body)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("started without docker")
+    finally:
+        docker_argv = real_argv
+        CLAUDE_HOME = scratch / "no-claude-home"
+    assert set(RUNS_DIR.iterdir()) == before, set(RUNS_DIR.iterdir()) - before
 
     # Attachments are on disk before the container starts, inside its read-only folder mount.
     seen = []
