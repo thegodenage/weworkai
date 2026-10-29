@@ -10,6 +10,7 @@ defmodule Weworkai.Scheduling do
       define :active_asks, action: :active_asks, args: [:task_id]
       define :latest_job, action: :latest, args: [:task_id], not_found_error?: false
       define :agent_active_jobs, action: :active_for_agent, args: [:agent_id]
+      define :running_merges, action: :running_merges
       define :start_job, action: :start
       define :run_job, action: :run
       define :complete_job, action: :complete

@@ -105,9 +105,10 @@ function whoSelect(node, view, actions) {
           class: "select select-sm w-full",
           onchange: (event) => {
             const [type, value] = event.target.value.split(":")
-            actions.updateNode(node.id, type === "role" ? {agent_role: value, employee_id: null} : {employee_id: value, agent_role: null}, {
-              relabel: true,
-            })
+            const fields = type === "role" ? {agent_role: value, employee_id: null} : {employee_id: value, agent_role: null}
+            const role = type === "role" ? value : catalog.employee(value)?.role
+            // Only merger blocks merge into a branch: another role drops it.
+            actions.updateNode(node.id, role === "merger" ? fields : {...fields, merge_branch: null}, {relabel: true})
           },
         },
         [
@@ -198,6 +199,23 @@ function promptField(node, actions) {
     "Instructions for this block",
     area,
     "Added to the agent's prompt each time this block runs, after its role's instructions. Only in this workflow.",
+  )
+}
+
+function mergeBranchField(node, actions) {
+  const input = el("input", {
+    id: "wf-inspector-merge-branch",
+    class: "input input-sm w-full font-mono",
+    maxlength: "255",
+    spellcheck: "false",
+    placeholder: "the checked-out branch",
+    value: node.merge_branch || "",
+    onchange: (event) => actions.updateNode(node.id, {merge_branch: event.target.value.trim() || null}),
+  })
+  return field(
+    "Merge into",
+    input,
+    "The branch this block merges the task's branch into, without asking anyone. Blank: the branch checked out in the task's repository.",
   )
 }
 
@@ -297,6 +315,7 @@ function nodePanel(node, view, actions) {
     problemsList(messages),
     field("Name", labelInput(node, actions)),
     whoSelect(node, view, actions),
+    catalog.roleOf(node) === "merger" ? mergeBranchField(node, actions) : null,
     node.kind === "agent" ? promptField(node, actions) : null,
     node.kind === "agent" ? timeoutsField(node, actions) : null,
     isGroup(node) ? colorPicker(node, view, actions) : null,

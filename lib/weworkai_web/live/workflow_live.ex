@@ -20,7 +20,14 @@ defmodule WeworkaiWeb.WorkflowLive do
   # A human block stands for the wait itself, so it is no column a block moves the task to.
   @columns Status.values() -- [:await_human_supervision]
 
-  @role_tones %{planner: "violet", coder: "blue", reviewer: "amber", qa: "sky", custom: "slate"}
+  @role_tones %{
+    planner: "violet",
+    coder: "blue",
+    reviewer: "amber",
+    qa: "sky",
+    merger: "green",
+    custom: "slate"
+  }
 
   @impl true
   def mount(%{"id" => id}, _session, socket) do

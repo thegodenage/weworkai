@@ -5,9 +5,11 @@ defmodule Weworkai.Workflows.Engine do
   profile and folder), a human block waits for a decision, a column block moves the task
   (done and canceled end the workflow), a group enters its first block, a triage block
   routes on the worst severity among the open findings. A run's result is
-  an outcome (`plan_ready`, `needs_answers`, `done`, `blocked`, `clean`, `findings`) that
-  `Graph.route/4` turns into the next arrow. Questions a human asks about the task (stage
-  `ask`) are answered beside the graph, without moving the task.
+  an outcome (`plan_ready`, `needs_answers`, `done`, `blocked`, `clean`, `findings`,
+  `merged`) that `Graph.route/4` turns into the next arrow. Questions a human asks about
+  the task (stage `ask`) are answered beside the graph, without moving the task; a merge a
+  human asks for at a gate (`merge/2`) runs beside it too and brings the task back to that
+  gate.
 
   The scheduler reports every run's start, result and failure here. Each is applied in the
   same transaction as the attempt's own transition, and that transition only accepts a
@@ -38,12 +40,15 @@ defmodule Weworkai.Workflows.Engine do
   @max_block_runs 100
 
   @review_roles [:reviewer, :qa]
+  # Roles that work on the coder's branch, so only once there is one.
+  @needs_code [:merger | @review_roles]
 
   @doc "The task stage an agent in `role` works in; nil runs the task as written."
   def stage(:planner), do: :planning
   def stage(:coder), do: :coding
   def stage(:reviewer), do: :code_review
   def stage(:qa), do: :qa
+  def stage(:merger), do: :merging
   def stage(:custom), do: nil
 
   @doc "Names the task's worktree, branch and docker reviewer containers."
@@ -65,6 +70,30 @@ defmodule Weworkai.Workflows.Engine do
     task.status == :await_human_supervision and is_nil(task.stage) and
       not is_nil(task.worktree_branch) and not restartable?(task)
   end
+
+  @doc """
+  Whether a human can have the merger merge the task's branch now (`merge/2`): it waits
+  for a human, has a branch, is not planning or coding, and is on a human block, a merger
+  block (that stopped, or after a merge that failed) or past the end of its workflow.
+  Another agent block's step is not done, so a merge there would skip it.
+  """
+  def mergeable?(task) do
+    task.status == :await_human_supervision and task.stage in [nil, :merging] and
+      not is_nil(task.worktree_branch) and merge_place?(task)
+  end
+
+  defp merge_place?(task) do
+    graph = Workflows.running!(task).graph
+
+    case Graph.node(graph, task.current_node_id) do
+      nil -> true
+      %{kind: :human} -> true
+      node -> Graph.role(graph, node.id) == :merger
+    end
+  end
+
+  @doc "The agent that merges when a human asks: the first runnable merger, nil when none."
+  def merger, do: first_runnable(:merger)
 
   @doc "Where every run on the task finds its attached files, relative to its working directory."
   def attachments_folder(task), do: ".weworkai/attachments/#{short_id(task)}"
@@ -378,11 +407,16 @@ defmodule Weworkai.Workflows.Engine do
 
   defp finished(stage, result, %{task: task} = job, run) do
     {own, outcome} = outcome(stage, result, job, run)
-    task = merge(task, own.task)
+    task = with_fields(task, own.task)
     running = Workflows.running!(task)
     graph = running.graph
 
     case Graph.node(graph, task.current_node_id) do
+      # A merge a human asked for beside the graph (`merge/2`, a job on no block): back to
+      # where the task waited, whatever came of it, so the human still decides.
+      node when stage == :merging and is_nil(job.node_id) ->
+        Transition.merge(own, back_to_gate(node))
+
       nil ->
         Transition.merge(
           own,
@@ -440,7 +474,9 @@ defmodule Weworkai.Workflows.Engine do
          code_session_connector_id: connector_id(agent),
          outcome_summary: result.summary,
          open_questions: [],
-         findings: []
+         findings: [],
+         merged_into: nil,
+         merge_commit: nil
        },
        messages: [agent_message(:coder, :outcome, result.summary)]
      }, :done}
@@ -461,6 +497,52 @@ defmodule Weworkai.Workflows.Engine do
      }, review_outcome(findings)}
   end
 
+  # A merge is only recorded as the one asked for: a report naming another branch (or none)
+  # is no merge of the target, and a human checks the repository.
+  defp outcome(:merging, %{status: :merged} = result, %{merge_branch: asked} = job, run)
+       when result.branch == "" or (not is_nil(asked) and result.branch != asked) do
+    reported = if result.branch == "", do: "no branch", else: "`#{result.branch}`"
+    wanted = if asked, do: "`#{asked}`", else: "the checked-out branch"
+
+    summary =
+      "The merger reported a merge into #{reported}, but was asked for #{wanted}. " <>
+        "Check the repository before going on.\n\n#{result.summary}"
+
+    outcome(
+      :merging,
+      %{result | status: :blocked, summary: summary, branch: asked || ""},
+      job,
+      run
+    )
+  end
+
+  defp outcome(:merging, %{status: :merged} = result, %{task: task}, _run) do
+    {%Transition{
+       task: %{merged_into: result.branch, merge_commit: commit_hash(result.commit)},
+       messages: [agent_message(:merger, :outcome, result.summary)],
+       notifications: [
+         notification(
+           :merged,
+           "Merged: #{task.title}",
+           "Into #{result.branch}#{commit_note(commit_hash(result.commit))}."
+         )
+       ]
+     }, :merged}
+  end
+
+  defp outcome(:merging, %{status: :blocked} = result, %{task: task}, _run) do
+    {%Transition{
+       messages: [agent_message(:merger, :outcome, result.summary)],
+       notifications: [
+         notification(
+           :merge_blocked,
+           "Merge blocked: #{task.title}",
+           "The merger could not merge into #{blank_to_checked_out(result.branch)}. Its message on the task says why."
+         )
+       ]
+     }, :blocked}
+  end
+
   defp outcome(nil, summary, %{agent: agent}, _run) do
     {%Transition{
        task: %{outcome_summary: summary},
@@ -470,6 +552,28 @@ defmodule Weworkai.Workflows.Engine do
 
   defp review_outcome([]), do: :clean
   defp review_outcome(_findings), do: :findings
+
+  # Only something shaped like a commit hash is shown as the merge commit.
+  defp commit_hash(commit) do
+    if Regex.match?(~r/\A[0-9a-f]{7,40}\z/, commit), do: commit
+  end
+
+  defp blank_to_checked_out(""), do: "the checked-out branch"
+  defp blank_to_checked_out(branch), do: branch
+
+  defp commit_note(commit) when commit in [nil, ""], do: ""
+  defp commit_note(commit), do: " (#{String.slice(commit, 0, 7)})"
+
+  # The task waits where it was again, as it was: at a human block (or past its workflow's
+  # end) outside any stage, on a stopped merger block still merging. The merge never took
+  # the assignee, so whoever had the task still has it.
+  defp back_to_gate(node) do
+    stage = if node && node.kind == :agent, do: :merging
+    %Transition{task: %{status: :await_human_supervision, stage: stage}}
+  end
+
+  defp back_to_gate_of(task),
+    do: back_to_gate(Graph.node(Workflows.running!(task).graph, task.current_node_id))
 
   ## Walking the graph
 
@@ -524,7 +628,7 @@ defmodule Weworkai.Workflows.Engine do
   defp counts(task), do: %{edges: task.edge_counts, nodes: task.node_counts}
 
   defp traverse(task, edge),
-    do: merge(task, %{edge_counts: Map.update(task.edge_counts, edge.id, 1, &(&1 + 1))})
+    do: with_fields(task, %{edge_counts: Map.update(task.edge_counts, edge.id, 1, &(&1 + 1))})
 
   defp enter(_task, _graph, _id, _arrival, hops) when hops > @max_hops do
     {:error,
@@ -544,7 +648,7 @@ defmodule Weworkai.Workflows.Engine do
          reason: "A block ran over #{@max_block_runs} times. The workflow may have an unbounded loop."
        )}
     else
-      task = merge(task, %{current_node_id: node.id, node_counts: node_counts})
+      task = with_fields(task, %{current_node_id: node.id, node_counts: node_counts})
       arrive(node, task, graph, arrival, hops)
     end
   end
@@ -611,7 +715,7 @@ defmodule Weworkai.Workflows.Engine do
 
   # Any other column passes the task on along its arrow, or keeps it there without one.
   defp arrive(%{kind: :column} = node, task, graph, _arrival, hops) do
-    task = merge(task, %{status: node.column_status})
+    task = with_fields(task, %{status: node.column_status})
     here = %Transition{task: Map.put(place(task), :status, node.column_status)}
 
     case Graph.route(graph, node.id, nil, counts(task)) do
@@ -665,7 +769,7 @@ defmodule Weworkai.Workflows.Engine do
         do: {"code review", "reviewer"},
         else: {"docker review", "docker reviewer"}
 
-    task = merge(task, %{stage: stage(role)})
+    task = with_fields(task, %{stage: stage(role)})
 
     Transition.merge(
       %Transition{
@@ -686,9 +790,9 @@ defmodule Weworkai.Workflows.Engine do
     stage = stage(role)
 
     with {:ok, worktree} <- worktree(role, agent, task) do
-      task = merge(task, worktree)
+      task = with_fields(task, worktree)
       fix? = role == :coder and fix?(task, arrival)
-      task = if fix?, do: merge(task, %{review_round: task.review_round + 1}), else: task
+      task = if fix?, do: with_fields(task, %{review_round: task.review_round + 1}), else: task
       {prompt, resume} = prompt(node, role, task, graph, agent, arrival, fix?)
 
       attrs =
@@ -721,6 +825,8 @@ defmodule Weworkai.Workflows.Engine do
         |> Map.reject(fn {_limit, minutes} -> is_nil(minutes) end)
 
       job = Map.merge(job, limits)
+      # What a merger was asked for, which its reported result must match.
+      job = if role == :merger, do: Map.put(job, :merge_branch, node.merge_branch), else: job
 
       {:ok, %Transition{task: attrs, jobs: [job]}}
     end
@@ -753,6 +859,9 @@ defmodule Weworkai.Workflows.Engine do
   defp worktree(role, _agent, %{worktree_path: nil}) when role in @review_roles,
     do: {:error, NoWorktree.exception(target: :review)}
 
+  defp worktree(:merger, _agent, %{worktree_path: nil}),
+    do: {:error, NoWorktree.exception(target: :merge)}
+
   defp worktree(_role, _agent, _task), do: {:ok, %{}}
 
   # A block that ran before continues its conversation (planner, coder: one per role per
@@ -763,10 +872,10 @@ defmodule Weworkai.Workflows.Engine do
     case {conversation(role, task, connector_id(agent)), arrival.prompt} do
       {nil, _prompt} when fix? ->
         fix = Prompts.fix(task.findings, task.review_round, fix_round_limit(graph))
-        {Prompts.followed_by(first_prompt(role, task, agent, node.prompt), fix), nil}
+        {Prompts.followed_by(first_prompt(role, task, agent, node), fix), nil}
 
       {nil, _prompt} ->
-        {decided(first_prompt(role, task, agent, node.prompt), arrival.decision), nil}
+        {decided(first_prompt(role, task, agent, node), arrival.decision), nil}
 
       {session, nil} when fix? ->
         fix = Prompts.fix(task.findings, task.review_round, fix_round_limit(graph))
@@ -798,16 +907,21 @@ defmodule Weworkai.Workflows.Engine do
 
   defp connector_id(agent), do: agent.connector_link.connector_id
 
-  defp first_prompt(:planner, task, _agent, step), do: Prompts.plan(task, step)
-  defp first_prompt(:coder, task, _agent, step), do: Prompts.code(task, step)
+  defp first_prompt(:planner, task, _agent, node), do: Prompts.plan(task, node.prompt)
+  defp first_prompt(:coder, task, _agent, node), do: Prompts.code(task, node.prompt)
 
-  defp first_prompt(:reviewer, task, agent, step),
-    do: Prompts.review(task, diff(agent, task), step)
+  defp first_prompt(:reviewer, task, agent, node),
+    do: Prompts.review(task, diff(agent, task), node.prompt)
 
-  defp first_prompt(:qa, task, _agent, step), do: Prompts.qa(task, step)
-  defp first_prompt(:custom, task, _agent, step), do: Prompts.task(task, step)
+  defp first_prompt(:qa, task, _agent, node), do: Prompts.qa(task, node.prompt)
 
-  defp folder(role, task) when role in [:planner, :custom], do: task.repository
+  defp first_prompt(:merger, task, _agent, node),
+    do: Prompts.merge(task, node.merge_branch, node.prompt)
+
+  defp first_prompt(:custom, task, _agent, node), do: Prompts.task(task, node.prompt)
+
+  # The merger works in the repository: it holds the worktree and the target's checkout.
+  defp folder(role, task) when role in [:planner, :custom, :merger], do: task.repository
   defp folder(_role, task), do: task.worktree_path
 
   defp diff(agent, task) do
@@ -987,7 +1101,7 @@ defmodule Weworkai.Workflows.Engine do
   defp afresh(task, graph, node, arrival) do
     fresh = %{review_round: 0, findings: [], edge_counts: %{}, node_counts: %{}}
 
-    with {:ok, transition} <- enter(merge(task, fresh), graph, node.id, arrival, 0) do
+    with {:ok, transition} <- enter(with_fields(task, fresh), graph, node.id, arrival, 0) do
       {:ok, Transition.merge(%Transition{task: fresh}, transition)}
     end
   end
@@ -1064,7 +1178,7 @@ defmodule Weworkai.Workflows.Engine do
           open_questions: []
         }
 
-        task = edges |> Enum.reduce(task, &traverse(&2, &1)) |> merge(approved)
+        task = edges |> Enum.reduce(task, &traverse(&2, &1)) |> with_fields(approved)
         edge = List.last(edges)
 
         with {:ok, transition} <-
@@ -1185,6 +1299,102 @@ defmodule Weworkai.Workflows.Engine do
   defp decision_note(label, nil), do: "Decided: #{label}"
   defp decision_note(label, comment), do: "Decided: #{label}\n\n#{comment}"
 
+  ## Merge
+
+  @doc """
+  A human has the merger merge the task's branch into `branch` (nil: the branch checked
+  out in the repository) from where the task waits. Its place stays: the result brings
+  it back there (`finished/4`, a job on no block), so the human still decides. On a
+  merger block, a blank `branch` or the block's own runs the block again, with its target
+  and instructions, and its result routes on by the graph. Refused when no merger can run
+  or the name is no branch.
+  """
+  def merge(task, arguments) do
+    {task, graph} = prepare(task)
+    branch = arguments[:branch]
+
+    case merger_block(graph, task) do
+      %{merge_branch: target} = node when branch in [nil, target] ->
+        rerun_merger_block(task, graph, node, target)
+
+      _gate ->
+        merge_beside(task, branch)
+    end
+  end
+
+  @doc "The merger block the task is on, else nil: a blank merge there runs that block."
+  def merger_block(graph, task) do
+    node = Graph.node(graph, task.current_node_id)
+    if node && node.kind == :agent && Graph.role(graph, node.id) == :merger, do: node
+  end
+
+  # Walks the graph, so like every other such step not on a version with problems: its
+  # result could not route on.
+  defp rerun_merger_block(task, graph, node, target) do
+    target = target || "the checked-out branch"
+    arrival = arrival(queued?: true, strict?: true)
+
+    with :ok <- runnable_version(task),
+         {:ok, transition} <- enter(task, graph, node.id, arrival, 0) do
+      {:ok,
+       Transition.merge(
+         %Transition{
+           messages: [%{author: :human, kind: :decision, body: "Merge into #{target}"}],
+           events: [human_event(task, :merge, "Asked to merge into #{target}")]
+         },
+         transition
+       )}
+    end
+  end
+
+  defp runnable_version(task) do
+    case Workflows.running!(task) do
+      %{problems: []} -> :ok
+      running -> {:error, Refused.exception(reason: Workflows.not_runnable(running))}
+    end
+  end
+
+  defp merge_beside(task, branch) do
+    with :ok <- branch_name(branch),
+         {:ok, agent} <- pick(%{employee_id: nil, label: nil}, :merger, task, arrival([])),
+         {:ok, _worktree} <- worktree(:merger, agent, task) do
+      target = branch || "the checked-out branch"
+
+      {:ok,
+       %Transition{
+         task: %{
+           status: queued_status(:merging),
+           stage: :merging,
+           open_questions: []
+         },
+         messages: [%{author: :human, kind: :decision, body: "Merge into #{target}"}],
+         events: [human_event(task, :merge, "Asked to merge into #{target}")],
+         jobs: [
+           %{
+             task_id: task.id,
+             agent_id: agent.id,
+             # On no block: the audit timeline shows it as a merge, not a run of the gate.
+             node_id: nil,
+             stage: :merging,
+             folder: folder(:merger, task),
+             prompt: Prompts.merge(task, branch),
+             json_schema: Prompts.schema(:merging),
+             resume: nil,
+             merge_branch: branch
+           }
+         ]
+       }}
+    end
+  end
+
+  defp branch_name(nil), do: :ok
+
+  defp branch_name(branch) do
+    if Graph.branch_name?(branch),
+      do: :ok,
+      else: {:error, Refused.exception(reason: "“#{branch}” is not a branch name.")}
+  end
+
   ## Continue
 
   @doc """
@@ -1217,7 +1427,7 @@ defmodule Weworkai.Workflows.Engine do
     blocks =
       for node <- Graph.order(graph),
           node.kind in [:agent, :human],
-          task.worktree_path || Graph.role(graph, node.id) not in @review_roles,
+          task.worktree_path || Graph.role(graph, node.id) not in @needs_code,
           do: %{id: node.id, label: node.label}
 
     done = if task.status == :done, do: [], else: [%{id: "done", label: "Mark done"}]
@@ -1292,16 +1502,16 @@ defmodule Weworkai.Workflows.Engine do
   defp prepare(task) do
     task = Ash.load!(task, [:attachment_names, assignee: :agent], reuse_values?: true)
     running = Workflows.running!(task)
-    {merge(task, %{workflow_version: running.version}), running.graph}
+    {with_fields(task, %{workflow_version: running.version}), running.graph}
   end
 
   defp prepare_checked(task) do
     task = Ash.load!(task, [:attachment_names, assignee: :agent], reuse_values?: true)
     running = Workflows.running!(task)
-    {merge(task, %{workflow_version: running.version}), running}
+    {with_fields(task, %{workflow_version: running.version}), running}
   end
 
-  defp merge(task, attrs), do: Map.merge(task, attrs)
+  defp with_fields(task, attrs), do: Map.merge(task, attrs)
 
   ## Failures
 
@@ -1318,6 +1528,18 @@ defmodule Weworkai.Workflows.Engine do
       ],
       notifications: [notification(:agent_failed, "Question failed: #{job.task.title}", reason)]
     }
+  end
+
+  # A merge asked beside the graph that failed: the task waits where it was, as it was,
+  # so the gate's own actions (Mark done, another merge) stay.
+  defp failure(%{stage: :merging, node_id: nil} = job, reason) do
+    Transition.merge(
+      back_to_gate_of(job.task),
+      %Transition{
+        messages: [%{author: :agent, agent_role: :merger, kind: :system, body: reason}],
+        notifications: [notification(:agent_failed, "Merge failed: #{job.task.title}", reason)]
+      }
+    )
   end
 
   defp failure(job, reason) do

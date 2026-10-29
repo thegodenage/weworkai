@@ -124,7 +124,9 @@ defmodule Weworkai.Board.Task do
         :current_node_id,
         :workflow_version,
         :edge_counts,
-        :node_counts
+        :node_counts,
+        :merged_into,
+        :merge_commit
       ]
 
       require_atomic? false
@@ -205,6 +207,18 @@ defmodule Weworkai.Board.Task do
       change load(:assignee)
     end
 
+    # A human has the merger merge the task's branch from where it waits (Engine.merge/2).
+    update :merge do
+      # The branch to merge into; nil: the one checked out in the repository.
+      argument :branch, :string, constraints: [max_length: 255]
+      require_atomic? false
+
+      validate Validations.Mergeable
+      change Changes.Unchanged
+      change {Changes.Transition, step: :merge}
+      change load(:assignee)
+    end
+
     update :set_budget do
       accept [:budget_usd]
       require_atomic? false
@@ -280,6 +294,11 @@ defmodule Weworkai.Board.Task do
     attribute :code_session_connector_id, :uuid, public?: true
     attribute :worktree_path, :string, public?: true
     attribute :worktree_branch, :string, public?: true
+
+    # The merger's last merge of the worktree branch: the branch it went into and the merge
+    # commit. Cleared when the coder finishes new work.
+    attribute :merged_into, :string, public?: true
+    attribute :merge_commit, :string, public?: true
 
     # Fix rounds: times the coder was sent back with the reviewers' findings.
     attribute :review_round, :integer do

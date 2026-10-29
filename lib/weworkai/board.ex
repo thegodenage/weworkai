@@ -46,6 +46,7 @@ defmodule Weworkai.Board do
       define :approve_plan, action: :approve_plan, args: [{:optional, :coder_employee_id}]
       define :decide_task, action: :decide, args: [:edge_id, {:optional, :comment}]
       define :continue_task, action: :continue, args: [{:optional, :target}]
+      define :merge_task, action: :merge, args: [{:optional, :branch}]
       define :set_task_budget, action: :set_budget, args: [:budget_usd]
       define :upgrade_task_workflow, action: :upgrade_workflow
     end

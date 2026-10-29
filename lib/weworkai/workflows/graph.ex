@@ -37,6 +37,7 @@ defmodule Weworkai.Workflows.Graph do
     coder: ~w(done blocked),
     reviewer: ~w(clean findings),
     qa: ~w(clean findings),
+    merger: ~w(merged blocked),
     custom: ~w(done)
   }
 
@@ -60,6 +61,20 @@ defmodule Weworkai.Workflows.Graph do
       Enum.any?(findings, &(&1.severity == severity))
     end)
   end
+
+  @doc """
+  Whether `name` can be a git branch (`git check-ref-format --branch`): letters, digits,
+  `.`, `_`, `-` and `/` between parts, no `..`, no part starting with `.` or ending with
+  `.lock`, not starting with `-` or `/`, not ending with `/` or `.`, and not `HEAD`.
+  """
+  def branch_name?(name) when is_binary(name),
+    do:
+      Regex.match?(
+        ~r{\A(?![-/.])(?!HEAD\z)(?!.*(?:\.\.|//|/\.|\.lock(?:/|\z)))[A-Za-z0-9._/-]+(?<![/.])\z},
+        name
+      )
+
+  def branch_name?(_name), do: false
 
   ## Building
 
@@ -151,7 +166,8 @@ defmodule Weworkai.Workflows.Graph do
     {:color, Color, nil},
     {:prompt, {:string, max_length: 20_000}, nil},
     {:stall_timeout_minutes, {:integer, min: 1, max: 1440}, nil},
-    {:turn_timeout_minutes, {:integer, min: 1, max: 1440}, nil}
+    {:turn_timeout_minutes, {:integer, min: 1, max: 1440}, nil},
+    {:merge_branch, {:string, max_length: 255}, nil}
   ]
 
   @edge_fields [
@@ -235,6 +251,8 @@ defmodule Weworkai.Workflows.Graph do
   defp field_message(limit) when limit in [:stall_timeout_minutes, :turn_timeout_minutes],
     do: "Timeouts must be whole minutes from 1 to 1440"
 
+  defp field_message(:merge_branch), do: "A branch name can be at most 255 characters"
+
   defp field_message(name), do: "Invalid #{String.replace(to_string(name), "_", " ")}"
 
   defp blank_to_nil(value) when is_binary(value) do
@@ -285,6 +303,7 @@ defmodule Weworkai.Workflows.Graph do
   defp node_problems(node, by_id, edges, employees) do
     [
       settings_problem(node, employees),
+      merge_branch_problem(node, employees),
       group_problem(node, by_id),
       if(node.kind == :group, do: entry_problem(node, by_id, edges)),
       if(node.kind == :human, do: decisions_problem(node, edges))
@@ -342,6 +361,23 @@ defmodule Weworkai.Workflows.Graph do
   defp settings_problem(%{kind: :triage} = node, _employees) do
     if node.employee_id || node.agent_role || node.column_status,
       do: "Triage blocks name no employee or column"
+  end
+
+  defp merge_branch_problem(%{merge_branch: nil}, _employees), do: nil
+
+  defp merge_branch_problem(node, employees) do
+    role = node.agent_role || get_in(employees, [node.employee_id, :role])
+
+    cond do
+      node.kind != :agent or role != :merger ->
+        "Only merger blocks merge into a branch"
+
+      not branch_name?(node.merge_branch) ->
+        "“#{node.merge_branch}” is not a branch name"
+
+      true ->
+        nil
+    end
   end
 
   defp group_problem(%{group_id: nil}, _by_id), do: nil

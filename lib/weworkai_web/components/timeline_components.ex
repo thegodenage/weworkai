@@ -18,6 +18,7 @@ defmodule WeworkaiWeb.TimelineComponents do
     coding: "blue",
     code_review: "sky",
     qa: "green",
+    merging: "amber",
     ask: "slate"
   }
 

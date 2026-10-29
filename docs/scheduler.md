@@ -174,6 +174,14 @@ and the next tick dispatches the waiting attempt. Sub-tasks (`Task.parent_id`, s
 at creation) are bookkeeping: they inherit the parent's repository and workflow and don't
 hold the parent back unless also added as its blockers.
 
+### One merge per checkout
+
+A merger run (`stage: :merging`) works in its task's repository, where it may merge in the
+main checkout. Two at once in the same folder would trip over each other's merge, so
+`dispatch_due/0` starts a due merger attempt only while no other merger job in that folder
+is `in_progress` (`Scheduling.running_merges/0`, plus those it started in the same tick).
+The attempt stays `pending` and starts on a later tick; nothing fails or times out.
+
 ## Retries
 
 `Scheduling.StartFailure` classifies a failed start by its Ash error class. `Invalid`

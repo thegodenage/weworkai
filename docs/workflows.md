@@ -12,7 +12,7 @@ Code: `lib/weworkai/workflows/` (Ash domain `Weworkai.Workflows`; resources
 
 | kind | names | entering it |
 |---|---|---|
-| `agent` | an agent employee **or** a role (`agent_role`: "any planner") | queue a run for its agent; the role decides prompt, schema, profile and folder (planner, coder, reviewer, qa, custom) |
+| `agent` | an agent employee **or** a role (`agent_role`: "any planner") | queue a run for its agent; the role decides prompt, schema, profile and folder (planner, coder, reviewer, qa, merger, custom) |
 | `human` | a human employee, or nobody ("any human") | task → `await_human_supervision` (assignee = that human, or nobody for "any human"); the task page shows one decision button per arrow out |
 | `column` | `column_status` (a board column) | move the task there; `done` / `canceled` end the workflow (`current_node_id` → nil); any other column passes the task on along its unnamed arrow, or keeps it there without one (moving it to todo then starts the workflow over, since entering that column again would only move it back) |
 | `group` | children (blocks with `group_id`), rectangle geometry | enter its entry block (the child no arrow from a sibling points to; with a loop drawn inside, where every child has one, the first drawn of those that reach all the others); an outcome a child has no arrow for (one that never runs out) leaves the group by the group's own arrows, so Reviewer `findings` → Coder inside a group still leaves it on `clean`. An arrow from outside straight to a child (or a human starting one) enters the group too: its self-loop counts runs afresh |
@@ -58,7 +58,8 @@ the create form has no assignee.
 `from → to`, optional **condition** (outcome label; nil = "always") and **iterations**.
 
 - Outcomes an agent block ends with: planner `plan_ready`, `needs_answers` (the plan has
-  questions); coder `done`, `blocked`; reviewer / qa `clean`, `findings`; custom `done`.
+  questions); coder `done`, `blocked`; reviewer / qa `clean`, `findings`; merger `merged`,
+  `blocked`; custom `done`.
   A triage block ends with `high`, `medium`, `low` or `clean`.
   A reviewer's outcome counts **the round's findings so far** (its own plus earlier
   reviewers' since the coder last finished), so a second reviewer can carry the first's
@@ -119,6 +120,21 @@ the create form has no assignee.
   blocks only, 1–1440, blank = the defaults 15 and 120): copied onto each job the block
   queues. A run silent or running that long is stopped and retried, then handed to a human
   (docs/scheduler.md, "Timeouts").
+- **A merger block** (role `merger`) merges the task's branch with no human asked: into
+  its `merge_branch` (`workflow_nodes.merge_branch`, the inspector's "Merge into"; blank =
+  the branch checked out in the task's repository). It needs a worktree, "Nothing to merge
+  yet" otherwise: an arrow into it leaves the task waiting on it, and a workflow that
+  starts on it refuses the move to Todo, like one that starts on a reviewer. `merged` routes on (e.g. → Column Done); `blocked`
+  (a conflict it can't settle, a dirty checkout, a missing branch) pauses on the block
+  unless an arrow takes it, and Continue (or a blank "Merge with agent", or one into its
+  own branch) runs it again. A merge there into another branch runs beside the graph and
+  leaves the task on the block. A reported merge into another branch than the one asked
+  for (or none) counts as `blocked`. Only merger blocks may name a
+  branch, and it must look like one (`Graph.branch_name?/1`). Example automatic merge:
+
+  ```
+  Docker reviewer --clean--> Merger (release) --merged--> Column Done
+  ```
 
 ## Default workflow (seeded by migration, first in list)
 
@@ -222,7 +238,8 @@ outcome carries the code reviewer's findings too):
 - `workflow_nodes`: workflow, kind, employee_id?, agent_role?, column_status?, group_id?
   (parent group), label, x, y, width?, height?, start, color? (a group's, editor only),
   prompt? (an agent block's own instructions; saved, copied and undone with the graph),
-  stall_timeout_minutes?, turn_timeout_minutes? (its runs' timeouts; nil = the job's defaults).
+  stall_timeout_minutes?, turn_timeout_minutes? (its runs' timeouts; nil = the job's defaults),
+  merge_branch? (a merger block's target; nil = the checked-out branch).
   Employee removed → `employee_id` nilified; entering such an agent block hands the task
   to a human, and the editor flags it.
 - `workflow_edges`: workflow, from_node, to_node, condition?, iterations?, from_port,

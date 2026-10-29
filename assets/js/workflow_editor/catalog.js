@@ -1,7 +1,7 @@
 // What blocks can name (employees, roles, columns) and what their arrows can say, from the
 // catalog the server renders into the page (WorkflowLive.catalog/1).
 
-const ROLE_TONES = {planner: "violet", coder: "blue", reviewer: "amber", qa: "sky", custom: "slate"}
+const ROLE_TONES = {planner: "violet", coder: "blue", reviewer: "amber", qa: "sky", merger: "green", custom: "slate"}
 const ENDING_COLUMNS = ["done", "canceled"]
 
 export const DECISION_SUGGESTIONS = ["accepted", "not accepted", "approved", "continue", "changes requested"]
@@ -39,12 +39,14 @@ export function createCatalog({employees, roles, columns, colors, triage_outcome
     switch (node.kind) {
       case "agent": {
         const agent = agentOf(node)
+        // A merger block's target branch, when it names one.
+        const into = roleOf(node) === "merger" && node.merge_branch ? ` → ${node.merge_branch}` : ""
         if (agent && agent.kind === "agent") {
-          return {subtitle: roleLabel(agent.role), tone: ROLE_TONES[agent.role], avatar: initials(agent.name)}
+          return {subtitle: `${roleLabel(agent.role)}${into}`, tone: ROLE_TONES[agent.role], avatar: initials(agent.name)}
         }
         if (node.agent_role) {
           return {
-            subtitle: `Any ${roleLabel(node.agent_role).toLowerCase()}`,
+            subtitle: `Any ${roleLabel(node.agent_role).toLowerCase()}${into}`,
             tone: ROLE_TONES[node.agent_role],
             icon: "hero-cpu-chip-micro",
           }

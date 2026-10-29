@@ -103,6 +103,9 @@ PROFILES = {
     "coder": Profile(folder_writable=True, git_writable=True, docker=False),
     "custom": Profile(folder_writable=True, git_writable=True, docker=False),
     "qa": Profile(folder_writable=True, git_writable=False, docker=True),
+    # Runs in the repository: its checkout, the task's worktree inside it and the git
+    # directory are writable, so it can merge wherever the target branch is checked out.
+    "merger": Profile(folder_writable=True, git_writable=True, docker=False),
 }
 
 # Runs the app starts are named cph-<8 chars>.
@@ -1086,6 +1089,8 @@ def test_docker_argv(scratch, body, conversation):
     assert mount_flags(argv("custom", repo)) == [
         volume, bind(repo, False), bind(git_dir / "config", True), bind(git_dir / "hooks", True)]
     assert mount_flags(argv("custom", scratch)) == [volume, bind(scratch, False)]
+    assert mount_flags(argv("merger", repo)) == [
+        volume, bind(repo, False), bind(git_dir / "config", True), bind(git_dir / "hooks", True)]
 
     qa = argv("qa", worktree, sidecar="cph-0123abcd-dind")
     assert mount_flags(qa) == [volume, bind(worktree, False), bind(git_dir, True)], mount_flags(qa)

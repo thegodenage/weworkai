@@ -10,6 +10,12 @@ defmodule Weworkai.Workflows.Result do
           | Plan.t()
           | %{status: :done | :blocked, summary: String.t(), questions: [Question.t()]}
           | %{summary: String.t(), findings: [Finding.t()]}
+          | %{
+              status: :merged | :blocked,
+              summary: String.t(),
+              branch: String.t(),
+              commit: String.t()
+            }
 
   @spec parse(atom() | nil, map()) :: {:ok, t()} | {:error, String.t()}
   def parse(nil, session), do: {:ok, session.result || "The agent finished without a summary."}
@@ -32,6 +38,24 @@ defmodule Weworkai.Workflows.Result do
   end
 
   def parse(:coding, _session), do: mismatch("outcome")
+
+  def parse(
+        :merging,
+        %{
+          structured: %{"status" => status, "summary" => summary, "branch" => branch} = structured
+        }
+      )
+      when status in ["merged", "blocked"] and is_binary(summary) and is_binary(branch) do
+    {:ok,
+     %{
+       status: String.to_existing_atom(status),
+       summary: summary,
+       branch: branch,
+       commit: Map.get(structured, "commit") || ""
+     }}
+  end
+
+  def parse(:merging, _session), do: mismatch("merge")
 
   def parse(stage, %{structured: %{"summary" => summary, "findings" => findings}})
       when stage in [:code_review, :qa] and is_list(findings) do
