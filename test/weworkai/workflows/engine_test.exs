@@ -220,6 +220,35 @@ defmodule Weworkai.Workflows.EngineTest do
       assert {:ok, %{status: :done}} = Board.move_task(task, :done)
     end
 
+    test "a coder on a folder of repositories gets a headless worktree and is told so",
+         %{bridge: bridge, connector: connector} do
+      team = team(connector, [:planner, :coder, :reviewer])
+
+      # BridgeStub answers a folder ending in /workspace with repositories api and web.
+      task =
+        Board.create_task!(%{
+          title: "Greet users",
+          description: "Say hello in every app",
+          repository: "/repos/workspace"
+        })
+
+      Board.move_task!(task, :todo)
+      BridgeStub.step(bridge)
+      flush_bridge()
+
+      task = Board.approve_plan!(Board.get_task!(task.id), team.coder.id)
+      assert task.worktree_repositories == ["api", "web"]
+
+      BridgeStub.step(bridge)
+      assert [%{"profile" => "coder", "prompt" => prompt}] = started_runs()
+      assert prompt =~ "one git worktree per repository (`api/`, `web/`)"
+      assert prompt =~ "(in each repository you change)"
+
+      BridgeStub.step(bridge)
+      assert [%{"profile" => "reviewer", "prompt" => prompt}] = started_runs()
+      assert prompt =~ "one git worktree per repository (`api/`, `web/`)"
+    end
+
     test "missing reviewers are skipped with a notification", %{bridge: bridge} = context do
       {task, team} = planned_task(context, [])
       Board.approve_plan!(task, team.coder.id)

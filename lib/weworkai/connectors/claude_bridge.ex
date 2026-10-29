@@ -10,6 +10,9 @@ defmodule Weworkai.Connectors.ClaudeBridge do
 
   def models, do: request(:get, "/models")
 
+  @doc "Host tools agents get with the user's login, the shared ~/.claude and recent host-tool calls."
+  def host_tools, do: request(:get, "/tools")
+
   @doc "A 422 comes back as `{:error, {:rejected, reason}}`: the bridge refused this run as asked."
   def start_session(spec), do: request(:post, "/sessions", spec, &{:rejected, &1})
 

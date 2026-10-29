@@ -21,6 +21,9 @@ defmodule Weworkai.Connectors do
 
   def worktree_diff(connector, path), do: adapter(connector).worktree_diff(path)
 
+  @doc "Host tools agents on the connector get, the shared agent config and recent host-tool calls."
+  def host_tools(connector), do: adapter(connector).host_tools()
+
   defp adapter(connector), do: Provider.adapter(connector.provider)
 
   @doc "The first connected connector by name, which backs default agents; nil when none is."

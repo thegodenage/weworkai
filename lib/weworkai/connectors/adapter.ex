@@ -47,13 +47,21 @@ defmodule Weworkai.Connectors.Adapter do
 
   @doc """
   An isolated checkout of `repo` named `name`, on its own branch from the repo's current
-  commit; the same name returns the existing one.
+  commit; the same name returns the existing one. When `repo` is a folder of repositories,
+  a folder with one worktree per repository (`repositories`, their folder names), each on
+  the same branch.
   """
   @callback create_worktree(repo :: String.t(), name :: String.t()) ::
               {:ok, worktree()} | {:error, String.t()}
 
   @doc "Everything changed in a worktree since it branched off, committed or not."
   @callback worktree_diff(path :: String.t()) :: {:ok, String.t()} | {:error, String.t()}
+
+  @doc """
+  What agents reach beyond their folder: the host CLIs that act with the user's login, the
+  parts of the user's agent config they get a copy of, and the latest host-tool calls.
+  """
+  @callback host_tools() :: {:ok, host_tools()} | {:error, String.t()}
 
   @typedoc """
   `profile` decides what the agent may do (`Weworkai.Agents.Agent.Role.profile/1`).
@@ -91,7 +99,44 @@ defmodule Weworkai.Connectors.Adapter do
           result: String.t() | nil,
           structured: map() | nil,
           claude_session_id: String.t(),
-          usage: usage() | nil
+          usage: usage() | nil,
+          tools: tool_usage() | nil
+        }
+
+  @typedoc """
+  What a run could use (`available_tools`, `skills`, `host_tools`, `shared`) and what it used:
+  `calls` per tool, `skills_used`, and each `host_calls` command.
+  """
+  @type tool_usage :: %{
+          available_tools: [String.t()],
+          skills: [String.t()],
+          host_tools: [String.t()],
+          shared: [String.t()],
+          calls: %{String.t() => non_neg_integer()},
+          skills_used: [String.t()],
+          host_calls: [%{tool: String.t(), command: String.t()}]
+        }
+
+  @type host_tools :: %{
+          tools: [
+            %{
+              name: String.t(),
+              description: String.t(),
+              installed: boolean(),
+              logged_in: boolean(),
+              account: String.t() | nil
+            }
+          ],
+          shared: [%{name: String.t(), items: [String.t()]}],
+          recent: [
+            %{
+              at: DateTime.t(),
+              session_name: String.t(),
+              folder: String.t(),
+              tool: String.t(),
+              command: String.t()
+            }
+          ]
         }
 
   @typedoc "What one run used, its own turns only (not a resumed conversation's earlier ones)."
@@ -105,7 +150,12 @@ defmodule Weworkai.Connectors.Adapter do
           turns: non_neg_integer()
         }
 
-  @type worktree :: %{path: String.t(), branch: String.t(), base: String.t()}
+  @type worktree :: %{
+          path: String.t(),
+          branch: String.t(),
+          base: String.t() | nil,
+          repositories: [String.t()]
+        }
 
   @type model_options :: %{
           models: [%{id: String.t(), label: String.t()}],

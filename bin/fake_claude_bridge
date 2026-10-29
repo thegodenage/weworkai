@@ -210,7 +210,13 @@ def create_worktree(body):
     if not isinstance(name, str) or not re.match(r"^[0-9a-z-]{1,40}$", name):
         raise Rejected(422, "invalid worktree name")
     return {"path": f"{body.get('repo')}/.weworkai/worktrees/{name}", "branch": f"weworkai/{name}",
-            "base": "0" * 40}
+            "base": "0" * 40, "repositories": []}
+
+
+def list_tools(_body):
+    return {"hostTools": [{"name": "glab", "description": "GitLab CLI", "installed": True, "loggedIn": True,
+                           "account": "gitlab.example.com"}],
+            "claudeHome": [{"name": "skills", "items": ["release-notes"]}], "recent": []}
 
 
 def worktree_diff(_body):
@@ -239,6 +245,7 @@ GET_ROUTES = [
     (re.compile(r"^/auth/status$"), lambda _body: {"loggedIn": True, "email": "e2e@example.com",
                                                    "subscriptionType": "max", "authMethod": "claude.ai"}),
     (re.compile(r"^/models$"), lambda _body: {"version": "fake", "models": MODELS, "efforts": EFFORTS}),
+    (re.compile(r"^/tools$"), list_tools),
     (re.compile(r"^/sessions$"), lambda _body: {"sessions": [summary(run) for run in list(runs.values())]}),
     (re.compile(r"^/sessions/([0-9a-f]{8})$"), show_session),
     (re.compile(r"^/worktrees/diff$"), worktree_diff),

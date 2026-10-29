@@ -9,6 +9,9 @@ FROM docker:27.5.1-cli AS docker-cli
 FROM node:22-bookworm-slim
 
 ARG CLAUDE_CODE_VERSION=2.1.309
+# Host tools (bin/claude_bridge HOST_TOOLS): CLIs that act with the host user's login,
+# which the bridge passes in as environment variables.
+ARG GLAB_VERSION=1.126.0
 # The bridge passes the host user's ids on Linux so files the agent writes stay the
 # user's; Docker Desktop (macOS) maps ownership itself and keeps the defaults.
 ARG AGENT_UID=1000
@@ -24,6 +27,12 @@ COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins /usr/local/libexec/docker/cli-plugins
 
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && npm cache clean --force
+
+RUN curl -fsSL -o /tmp/glab.deb \
+      "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_$(dpkg --print-architecture).deb" \
+ && dpkg -i /tmp/glab.deb \
+ && rm /tmp/glab.deb \
+ && glab --version
 
 # Bind-mounted repositories belong to the host user, not to `agent`.
 RUN git config --system --add safe.directory '*'

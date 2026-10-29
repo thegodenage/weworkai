@@ -74,8 +74,9 @@ defmodule Weworkai.Connectors.Adapters.ClaudeCode do
 
   # A bridge from before lastEventAt existed doesn't say.
   defp last_event_at(nil), do: nil
+  defp last_event_at(iso8601), do: datetime(iso8601)
 
-  defp last_event_at(iso8601) do
+  defp datetime(iso8601) do
     {:ok, at, _offset} = DateTime.from_iso8601(iso8601)
     at
   end
@@ -91,9 +92,25 @@ defmodule Weworkai.Connectors.Adapters.ClaudeCode do
          result: session["result"],
          structured: session["structured"],
          claude_session_id: session["claudeSessionId"],
-         usage: usage(session["usage"])
+         usage: usage(session["usage"]),
+         tools: tools(session["tools"])
        }}
     end
+  end
+
+  # A bridge from before tool usage was reported.
+  defp tools(nil), do: nil
+
+  defp tools(%{"available" => available} = tools) do
+    %{
+      available_tools: available["tools"],
+      skills: available["skills"],
+      host_tools: available["hostTools"],
+      shared: available["sharedClaude"],
+      calls: tools["calls"],
+      skills_used: tools["skills"],
+      host_calls: Enum.map(tools["hostCalls"], &%{tool: &1["tool"], command: &1["command"]})
+    }
   end
 
   # A bridge from before usage was reported, or a run without a result yet.
@@ -118,9 +135,55 @@ defmodule Weworkai.Connectors.Adapters.ClaudeCode do
 
   @impl true
   def create_worktree(repo, name) do
-    with {:ok, %{"path" => path, "branch" => branch, "base" => base}} <-
+    with {:ok, %{"path" => path, "branch" => branch} = worktree} <-
            ClaudeBridge.create_worktree(repo, name) do
-      {:ok, %{path: path, branch: branch, base: base}}
+      # A bridge from before headless worktrees sends no repositories.
+      {:ok,
+       %{
+         path: path,
+         branch: branch,
+         base: worktree["base"],
+         repositories: worktree["repositories"] || []
+       }}
+    end
+  end
+
+  @impl true
+  def host_tools do
+    case ClaudeBridge.host_tools() do
+      {:ok, %{"hostTools" => tools, "claudeHome" => shared, "recent" => recent}} ->
+        {:ok,
+         %{
+           tools:
+             Enum.map(
+               tools,
+               &%{
+                 name: &1["name"],
+                 description: &1["description"],
+                 installed: &1["installed"],
+                 logged_in: &1["loggedIn"],
+                 account: &1["account"]
+               }
+             ),
+           shared: Enum.map(shared, &%{name: &1["name"], items: &1["items"]}),
+           recent:
+             Enum.map(
+               recent,
+               &%{
+                 at: datetime(&1["at"]),
+                 session_name: &1["name"],
+                 folder: &1["cwd"],
+                 tool: &1["tool"],
+                 command: &1["command"]
+               }
+             )
+         }}
+
+      {:ok, _other} ->
+        {:error, "Claude bridge is outdated. Restart `bin/claude_bridge`."}
+
+      {:error, message} ->
+        {:error, message}
     end
   end
 
