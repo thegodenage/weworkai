@@ -32,6 +32,10 @@ defmodule Weworkai.Workflows.Engine do
   # engine gives up on a graph that goes round without doing anything.
   @max_hops 50
 
+  # The most times a single block may run across all cycles of a task, as a safety net
+  # against infinite loops that slip past edge iteration limits.
+  @max_block_runs 100
+
   @review_roles [:reviewer, :qa]
 
   @doc "The task stage an agent in `role` works in; nil runs the task as written."
@@ -532,8 +536,16 @@ defmodule Weworkai.Workflows.Engine do
     {node, groups} = Graph.resolve(graph, id)
     entered = groups_entered(graph, id, arrival) ++ Enum.map(groups, & &1.id) ++ [node.id]
     node_counts = Enum.reduce(entered, task.node_counts, &count_run(&1, &2, arrival))
-    task = merge(task, %{current_node_id: node.id, node_counts: node_counts})
-    arrive(node, task, graph, arrival, hops)
+
+    if Enum.any?(Map.values(node_counts), &(&1 > @max_block_runs)) do
+      {:error,
+       Refused.exception(
+         reason: "A block ran over #{@max_block_runs} times. The workflow may have an unbounded loop."
+       )}
+    else
+      task = merge(task, %{current_node_id: node.id, node_counts: node_counts})
+      arrive(node, task, graph, arrival, hops)
+    end
   end
 
   # An arrow from outside a group into a block inside it enters the group too, as does a
@@ -895,17 +907,21 @@ defmodule Weworkai.Workflows.Engine do
   """
   def start(task, _arguments) do
     if Scheduling.active_jobs!(task.id) == [] do
-      {task, graph} = prepare(task)
+      {task, running} = prepare_checked(task)
+      graph = running.graph
 
-      case {resumable(graph, task), graph.start_id} do
-        {nil, nil} ->
+      cond do
+        running.problems != [] ->
+          {:error, Refused.exception(reason: Workflows.not_runnable(running))}
+
+        is_nil(resumable(graph, task)) and is_nil(graph.start_id) ->
           {:error, Refused.exception(reason: "This task's workflow has no start block yet.")}
 
-        {nil, start} ->
-          afresh(task, graph, Graph.node(graph, start), arrival(queued?: true))
+        is_nil(resumable(graph, task)) ->
+          afresh(task, graph, Graph.node(graph, graph.start_id), arrival(queued?: true))
 
-        {node, _start} ->
-          enter(task, graph, node.id, arrival(queued?: true), 0)
+        true ->
+          enter(task, graph, resumable(graph, task).id, arrival(queued?: true), 0)
       end
     else
       {:ok, %Transition{}}
@@ -1253,6 +1269,12 @@ defmodule Weworkai.Workflows.Engine do
     task = Ash.load!(task, [:attachment_names, assignee: :agent], reuse_values?: true)
     running = Workflows.running!(task)
     {merge(task, %{workflow_version: running.version}), running.graph}
+  end
+
+  defp prepare_checked(task) do
+    task = Ash.load!(task, [:attachment_names, assignee: :agent], reuse_values?: true)
+    running = Workflows.running!(task)
+    {merge(task, %{workflow_version: running.version}), running}
   end
 
   defp merge(task, attrs), do: Map.merge(task, attrs)

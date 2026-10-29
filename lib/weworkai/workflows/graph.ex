@@ -744,7 +744,7 @@ defmodule Weworkai.Workflows.Graph do
       label in @pausing and not Enum.any?(arrows, &(&1.condition == label)) ->
         route(graph, group_id, outcome, counts, spent?)
 
-      loop = Enum.find(loops, &(fits?.(&1) and runs < &1.iterations)) ->
+      loop = Enum.find(loops, &(fits?.(&1) and not is_nil(&1.iterations) and runs < &1.iterations)) ->
         {:follow, loop}
 
       named = Enum.find(open, &(&1.condition == label and not is_nil(label))) ->
