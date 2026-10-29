@@ -455,18 +455,32 @@ def share_claude_home(run_id):
         source = CLAUDE_HOME / entry
         if not source.exists():
             continue
-        if tree_size(source) > MAX_SHARED_BYTES:
-            print(f"claude_bridge: not sharing {short_path(source)}: over {MAX_SHARED_BYTES // 1_000_000} MB",
-                  flush=True)
-            continue
         target = copy / entry
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_dir():
-            shutil.copytree(source, target, symlinks=False, ignore=shutil.ignore_patterns(*SKIPPED_NAMES),
-                            ignore_dangling_symlinks=True)
-        else:
-            shutil.copyfile(source, target)
+        # Sharing is an extra: an entry that can't be copied (an unreadable file, a FIFO, a
+        # symlink loop) is left out rather than keeping the run from starting.
+        try:
+            if tree_size(source) > MAX_SHARED_BYTES:
+                print(f"claude_bridge: not sharing {short_path(source)}: over {MAX_SHARED_BYTES // 1_000_000} MB",
+                      flush=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, target, symlinks=False, ignore=shutil.ignore_patterns(*SKIPPED_NAMES),
+                                ignore_dangling_symlinks=True)
+            elif source.is_file():
+                shutil.copyfile(source, target)
+            else:
+                raise OSError("not a regular file")
+        except (OSError, shutil.Error) as error:
+            print(f"claude_bridge: not sharing {short_path(source)}: {str(error)[:200]}", flush=True)
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+            continue
         shared.append(Mount(target, read_only=True, target=f"{CONVERSATIONS_DIR}/{entry}"))
+    if not shared:
+        shutil.rmtree(copy, ignore_errors=True)
     return shared
 
 
@@ -777,10 +791,15 @@ def prune_runs(now):
                 else:
                     path.unlink(missing_ok=True)
             finished_runs.pop(meta["id"], None)
-    if TOOL_LOG.exists():
-        cutoff = datetime.fromtimestamp(now - KEEP_SECONDS, timezone.utc).isoformat()
-        kept = [call for call in read_events(TOOL_LOG) if str(call.get("at", "")) >= cutoff]
-        TOOL_LOG.write_text("".join(json.dumps(call) + "\n" for call in kept))
+    cutoff = datetime.fromtimestamp(now - KEEP_SECONDS, timezone.utc).isoformat()
+    # Under settle's lock, so a run settling meanwhile can't append between the read and
+    # the write; replaced whole, so GET /tools never reads it half written.
+    with settle_lock:
+        if TOOL_LOG.exists():
+            kept = [call for call in read_events(TOOL_LOG) if str(call.get("at", "")) >= cutoff]
+            temporary = TOOL_LOG.with_suffix(".tmp")
+            temporary.write_text("".join(json.dumps(call) + "\n" for call in kept))
+            temporary.replace(TOOL_LOG)
 
 
 def list_sessions(_body):
@@ -1439,6 +1458,13 @@ def test_shared_claude(scratch):
         assert shared_claude_entries() == [{"name": "CLAUDE.md", "items": []},
                                            {"name": "skills", "items": ["linked", "release-notes"]}]
         shutil.rmtree(copy)
+        # An entry that can't be copied is left out; the run still starts with the rest.
+        os.mkfifo(CLAUDE_HOME / "skills" / "release-notes" / "pipe")
+        (CLAUDE_HOME / "skills" / "loop").symlink_to("..")
+        shared = share_claude_home("0123abcd")
+        assert shared == [Mount(copy / "CLAUDE.md", True, f"{CONVERSATIONS_DIR}/CLAUDE.md")], shared
+        assert not (copy / "skills").exists()
+        shutil.rmtree(copy)
     finally:
         CLAUDE_HOME = scratch / "no-claude-home"
 
@@ -1466,6 +1492,11 @@ def test_tool_usage():
     assert tool_usage({}, [])["available"] == {"tools": [], "skills": [], "hostTools": [], "sharedClaude": []}
     log_tool_usage(meta, events)
     assert [(call["run"], call["tool"]) for call in recent_tool_calls()] == [("0123abcd", "glab")]
+    # Pruning keeps recent calls and drops old ones.
+    with TOOL_LOG.open("a") as log:
+        log.write(json.dumps({"at": "2000-01-01T00:00:00+00:00", "run": "00000000", "tool": "glab"}) + "\n")
+    prune_runs(time.time())
+    assert [call["run"] for call in recent_tool_calls()] == ["0123abcd"]
     assert host_tool_status(host_tool_logins()) == [{"name": "glab", "description": "GitLab CLI", "installed": True,
                                                      "loggedIn": True, "account": "gitlab.example.com"}]
     # Every role gets the host logins.
